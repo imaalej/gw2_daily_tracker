@@ -78,7 +78,7 @@ ResponseParser::ParseWorldBossMeta(const nlohmann::json& j,
         {
             if (e.id == schedule[i].id)
             {
-                for (int k = 0; schedule[i].spawnTimesUtcSec[k] != 0; ++k)
+                for (int k = 0; schedule[i].spawnTimesUtcSec[k] != -1; ++k)
                     e.spawnTimesUtcSec.push_back(schedule[i].spawnTimesUtcSec[k]);
                 foundInSchedule = true;
                 break;

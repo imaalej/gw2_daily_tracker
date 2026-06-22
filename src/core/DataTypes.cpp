@@ -9,46 +9,55 @@ namespace DailyTracker
 // ---------------------------------------------------------------------------
 // World-boss static schedule table
 // Times are seconds-from-midnight UTC.  Values from the community-maintained
-// GW2 wiki timer page.  A trailing 0 marks the end of each boss's list.
+// GW2 wiki timer page.
+// NOTE: The list is terminated by a -1 sentinel (NOT 0), because several
+// bosses spawn exactly at midnight (00:00 UTC = 0 seconds), so 0 is a valid
+// spawn time and cannot be used as an end-of-list marker.
 // ---------------------------------------------------------------------------
 static const WorldBossScheduleEntry s_worldBossSchedule[] =
 {
-    // id                           display name                               UTC times (sec)
+    // id                           display name                               UTC times (sec)  [-1 = sentinel]
     { "shadow_behemoth",            "Shadow Behemoth",                        { 0*3600+15*60,  2*3600+15*60,  4*3600+15*60,
                                                                                 6*3600+15*60,  8*3600+15*60, 10*3600+15*60,
-                                                                               12*3600+15*60, 0 } },
+                                                                               12*3600+15*60, -1 } },
     { "the_shatterer",              "The Shatterer",                          { 1*3600,         3*3600,        5*3600,
                                                                                 7*3600,         9*3600,       11*3600,
-                                                                               13*3600, 0 } },
+                                                                               13*3600, -1 } },
     { "great_jungle_wurm",          "Great Jungle Wurm",                      { 1*3600+30*60,   3*3600+30*60,  5*3600+30*60,
                                                                                 7*3600+30*60,   9*3600+30*60, 11*3600+30*60,
-                                                                               13*3600+30*60, 0 } },
+                                                                               13*3600+30*60, -1 } },
     { "megadestroyer",              "Megadestroyer",                          { 0*3600+30*60,   2*3600+30*60,  4*3600+30*60,
                                                                                 6*3600+30*60,   8*3600+30*60, 10*3600+30*60,
-                                                                               12*3600+30*60, 0 } },
+                                                                               12*3600+30*60, -1 } },
     { "fire_elemental",             "Fire Elemental",                         { 0*3600+45*60,   2*3600+45*60,  4*3600+45*60,
                                                                                 6*3600+45*60,   8*3600+45*60, 10*3600+45*60,
-                                                                               12*3600+45*60, 0 } },
+                                                                               12*3600+45*60, -1 } },
     { "tequatl_the_sunless",        "Tequatl the Sunless",                    { 0*3600,         3*3600,        7*3600,
-                                                                               11*3600+30*60,  19*3600,       23*3600, 0 } },
+                                                                               11*3600+30*60,  19*3600,       23*3600, -1 } },
     { "triple_trouble_wurm",        "Triple Trouble Wurm",                    { 1*3600,         4*3600,        8*3600,
-                                                                               12*3600+30*60,  20*3600, 0 } },
+                                                                               12*3600+30*60,  20*3600, -1 } },
     { "karka_queen",                "Karka Queen",                            { 2*3600,         6*3600,       10*3600,
-                                                                               15*3600,        23*3600+30*60, 0 } },
+                                                                               15*3600,        23*3600+30*60, -1 } },
     { "inquest_golem_mark_ii",      "Inquest Golem Mark II",                  { 1*3600,         5*3600,        9*3600,
-                                                                               14*3600,        19*3600,       23*3600, 0 } },
+                                                                               14*3600,        19*3600,       23*3600, -1 } },
     { "modniir_ulgoth",             "Modniir Ulgoth",                         { 1*3600+30*60,   5*3600+30*60,  9*3600+30*60,
-                                                                               14*3600+30*60,  19*3600+30*60, 23*3600+30*60, 0 } },
+                                                                               14*3600+30*60,  19*3600+30*60, 23*3600+30*60, -1 } },
     { "claw_of_jormag",             "Claw of Jormag",                         { 2*3600+30*60,   4*3600+30*60,  6*3600+30*60,
                                                                                 8*3600+30*60,  10*3600+30*60, 12*3600+30*60,
-                                                                               14*3600+30*60, 0 } },
-    { "svanir_shaman_chief",        "Svanir Shaman Chief",                   { 0,               2*3600,        4*3600,
+                                                                               14*3600+30*60, -1 } },
+    { "svanir_shaman_chief",        "Svanir Shaman Chief",                    { 0*3600,         2*3600,        4*3600,
                                                                                 6*3600,          8*3600,       10*3600,
-                                                                               12*3600, 0 } },
-    { "admiral_taidha_covington",   "Admiral Taidha Covington",               { 0,               3*3600,        6*3600,
+                                                                               12*3600, -1 } },
+    { "admiral_taidha_covington",   "Admiral Taidha Covington",               { 0*3600,         3*3600,        6*3600,
                                                                                 9*3600,         12*3600,       15*3600,
-                                                                               18*3600,         21*3600, 0 } },
-    { nullptr, nullptr, { 0 } } // sentinel
+                                                                               18*3600,         21*3600, -1 } },
+    // Bosses reported as missing from schedule in runtime logs:
+    { "drakkar",                    "Drakkar",                                { 0*3600+30*60,   3*3600+30*60,  6*3600+30*60,
+                                                                               10*3600+30*60,  14*3600+30*60, 18*3600+30*60,
+                                                                               22*3600+30*60, -1 } },
+    { "mists_and_monsters_titans",  "Mists and Monsters: Titans",             { 1*3600+30*60,   7*3600+30*60, 13*3600+30*60,
+                                                                               19*3600+30*60, -1 } },
+    { nullptr, nullptr, { -1 } } // sentinel
 };
 
 const WorldBossScheduleEntry* GetWorldBossScheduleTable()
@@ -131,7 +140,7 @@ int WorldBossEntry::SecondsUntilNextSpawn(std::time_t nowUtc) const
     {
         int diff = spawnSec - secondsToday;
         if (diff < 0)
-            diff += 86400; // wrap to next occurrence tomorrow
+            diff += 86400; // wrap to next occurrence tomorrow (or push midnight to 24h out)
         if (diff < minPositiveDiff)
             minPositiveDiff = diff;
     }

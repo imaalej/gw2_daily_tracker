@@ -136,7 +136,7 @@ struct WorldBossScheduleEntry
 {
     const char* id;
     const char* displayName;
-    int         spawnTimesUtcSec[9];   // up to 8 spawns; 0-terminated
+    int         spawnTimesUtcSec[9];   // up to 8 spawns; -1-terminated
 };
 
 // Returns the built-in schedule table (null-terminated array)

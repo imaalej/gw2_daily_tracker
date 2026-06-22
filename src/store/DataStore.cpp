@@ -76,6 +76,10 @@ void DataStore::Initialize()
         PostTask([this]() { BeginFetch(); });
     else
         SetStatus(FetchStatus::NoApiKey, "Enter your GW2 API key in Settings");
+
+    // Populate Ley-Line next-occurrence data immediately on startup so the
+    // section shows a countdown even before the player enters a map.
+    PostTask([this]() { LeyLine_RefreshNextOccurrence(); });
 }
 
 void DataStore::Tick()
@@ -87,8 +91,29 @@ void DataStore::Tick()
 
 void DataStore::ForceRefresh()
 {
-    if (m_settings.HasApiKey())
-        PostTask([this]() { BeginFetch(); });
+    if (!m_settings.HasApiKey())
+        return;
+
+    PostTask([this]()
+    {
+        // If a previous fetch got stuck in-flight (e.g. callback never fired due
+        // to a network timeout), clear the flag so a fresh fetch can proceed.
+        // We consider it stuck if it has been in-flight for more than 2 minutes.
+        if (m_fetchInFlight.load())
+        {
+            auto now     = std::chrono::system_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                               now - m_lastFetchTime).count();
+            if (elapsed > 120)
+            {
+                LogMessage(3, "DailyTracker",
+                    "ForceRefresh: clearing stuck m_fetchInFlight after "
+                    + std::to_string(elapsed) + "s");
+                m_fetchInFlight = false;
+            }
+        }
+        BeginFetch();
+    });
 }
 
 void DataStore::OnApiKeyChanged()
@@ -489,9 +514,6 @@ void DataStore::FetchStep_MapChestsCompletion(nlohmann::json metaJson)
 // ---------------------------------------------------------------------------
 void DataStore::FinalizeFetch()
 {
-    m_fetchInFlight = false;
-    m_dataUpdated   = true;
-
     DailySnapshot snap;
     {
         std::lock_guard<std::mutex> lk(m_pending.mtx);
@@ -505,10 +527,19 @@ void DataStore::FinalizeFetch()
         m_snapshot = std::move(snap);
     }
 
+    // Clear in-flight flag AFTER snapshot is committed so GetSnapshot()
+    // always returns fresh data by the time the UI sees the flag change.
+    m_fetchInFlight = false;
+    // Signal main thread to repaint regardless of whether a callback was set.
+    m_dataUpdated   = true;
+
     if (!m_anyStepFailed.load())
         SetStatus(FetchStatus::Ok, "");
 
     LogMessage(2, "DailyTracker", "FinalizeFetch: fetch cycle complete");
+
+    // Keep Ley-Line next-occurrence fresh after every refresh cycle.
+    LeyLine_RefreshNextOccurrence();
 
     try {
         m_cache.Save();
