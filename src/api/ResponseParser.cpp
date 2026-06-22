@@ -5,44 +5,9 @@
 namespace DailyTracker
 {
 
-// ---------------------------------------------------------------------------
-// /v2/account/wizardsvault/daily
-// Example response:
-// {
-//   "meta_progress_current": 2, "meta_progress_complete": 8,
-//   "objectives": [
-//     { "id": 1, "title": "Daily Login", "track": "PvE",
-//       "acclaim": 10, "progress_current": 1, "progress_complete": 1,
-//       "claimed": false }
-//   ]
-// }
-// ---------------------------------------------------------------------------
-std::vector<WizardsVaultObjective>
-ResponseParser::ParseWizardsVaultDaily(const nlohmann::json& j)
-{
-    std::vector<WizardsVaultObjective> result;
-    if (!j.is_object())
-        return result;
-
-    const auto& objs = j.value("objectives", nlohmann::json::array());
-    if (!objs.is_array())
-        return result;
-
-    for (const auto& obj : objs)
-    {
-        if (!obj.is_object())
-            continue;
-
-        WizardsVaultObjective o;
-        o.id              = SafeGet<int>(obj,  "id",                0);
-        o.title           = SafeGet<std::string>(obj, "title",      "");
-        o.progressCurrent = SafeGet<int>(obj,  "progress_current",  0);
-        o.progressComplete= SafeGet<int>(obj,  "progress_complete", 1);
-        o.claimed         = SafeGet<bool>(obj, "claimed",           false);
-        result.push_back(std::move(o));
-    }
-    return result;
-}
+// Forward declaration matching the one in APIManager.cpp / entry.cpp, so we
+// can log from here without introducing a circular header dependency.
+void LogMessage(int level, const std::string& channel, const std::string& message);
 
 // ---------------------------------------------------------------------------
 // /v2/account/worldbosses  →  ["shadow_behemoth", "tequatl_the_sunless", ...]
@@ -108,14 +73,23 @@ ResponseParser::ParseWorldBossMeta(const nlohmann::json& j,
             : CompletionState::Incomplete;
 
         // Populate spawn times from the built-in schedule table
+        bool foundInSchedule = false;
         for (int i = 0; schedule[i].id != nullptr; ++i)
         {
             if (e.id == schedule[i].id)
             {
-                for (int k = 0; schedule[i].spawnTimesUtcSec[k] != 0; ++k)
+                for (int k = 0; schedule[i].spawnTimesUtcSec[k] != -1; ++k)
                     e.spawnTimesUtcSec.push_back(schedule[i].spawnTimesUtcSec[k]);
+                foundInSchedule = true;
                 break;
             }
+        }
+
+        if (!foundInSchedule)
+        {
+            // LOGL_WARNING (3): lets us identify exact missing/mismatched
+            // IDs from the Nexus log so the schedule table can be updated.
+            LogMessage(3, "DailyTracker", "World boss ID not in schedule: " + e.id);
         }
 
         result.push_back(std::move(e));
@@ -130,55 +104,51 @@ ResponseParser::ParseWorldBossMeta(const nlohmann::json& j,
 }
 
 // ---------------------------------------------------------------------------
-// Home nodes
-// /v2/home/nodes?ids=all  →  [{ "id": "quartz_crystal", "name": "..." }, ...]
-// /v2/account/home/nodes  →  ["quartz_crystal", "black_lion_statuette", ...]
-//   (only IDs of nodes *unlocked* on the account; the API does NOT indicate
-//    harvest status directly - if the node is in the account list it is
-//    available to harvest, and considered "incomplete" unless the user has
-//    harvested it.  The GW2 API does not expose per-day harvest status, so
-//    we default to Incomplete and note this limitation in the UI.)
+// Item-count helpers for Ley-Line Anomaly completion detection.
+// Shared shape across /v2/account/bank, /v2/account/materials, and the
+// per-bag entries inside /v2/characters/:id/inventory:
+//   [ { "id": 19976, "count": 3, ... }, null, { "id": 79047, "count": 1 } ]
+// Null entries represent empty slots and are skipped.
 // ---------------------------------------------------------------------------
-std::vector<HomeNode>
-ResponseParser::ParseHomeNodes(const nlohmann::json& metaJson,
-                               const nlohmann::json& completionJson)
+int ResponseParser::SumItemCount(const nlohmann::json& itemArray, int itemId)
 {
-    // Build set of unlocked node IDs
-    std::set<std::string> unlockedIds;
-    if (completionJson.is_array())
+    int total = 0;
+    if (!itemArray.is_array())
+        return total;
+
+    for (const auto& entry : itemArray)
     {
-        for (const auto& item : completionJson)
-            if (item.is_string())
-                unlockedIds.insert(item.get<std::string>());
+        if (!entry.is_object())
+            continue; // null slot or malformed entry
+
+        if (SafeGet<int>(entry, "id", -1) == itemId)
+            total += SafeGet<int>(entry, "count", 0);
     }
+    return total;
+}
 
-    std::vector<HomeNode> result;
-    if (!metaJson.is_array())
-        return result;
+// /v2/characters/:id/inventory  →  { "bags": [ { "id":..., "size":...,
+//   "inventory": [ {"id":19976,"count":3}, null, ... ] }, null, ... ] }
+int ResponseParser::SumCharacterInventoryItemCount(const nlohmann::json& inventoryJson,
+                                                   int itemId)
+{
+    int total = 0;
+    if (!inventoryJson.is_object())
+        return total;
 
-    for (const auto& item : metaJson)
+    const auto& bags = inventoryJson.value("bags", nlohmann::json::array());
+    if (!bags.is_array())
+        return total;
+
+    for (const auto& bag : bags)
     {
-        if (!item.is_object())
-            continue;
+        if (!bag.is_object())
+            continue; // empty bag slot
 
-        std::string id = SafeGet<std::string>(item, "id", "");
-        if (unlockedIds.empty() || unlockedIds.count(id))
-        {
-            HomeNode n;
-            n.id         = id;
-            n.name       = SafeGet<std::string>(item, "name", PrettifyId(id));
-            // The API has no per-character harvest status; we mark Unknown
-            // so the UI can show "?" rather than a false green/red.
-            n.completion = CompletionState::Unknown;
-            result.push_back(std::move(n));
-        }
+        const auto& slots = bag.value("inventory", nlohmann::json::array());
+        total += SumItemCount(slots, itemId);
     }
-
-    std::sort(result.begin(), result.end(),
-              [](const HomeNode& a, const HomeNode& b)
-              { return a.name < b.name; });
-
-    return result;
+    return total;
 }
 
 // ---------------------------------------------------------------------------

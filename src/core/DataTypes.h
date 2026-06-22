@@ -18,25 +18,6 @@ enum class CompletionState : uint8_t
 };
 
 // -------------------------------------------------------------------------
-// Wizard's Vault daily objective
-// -------------------------------------------------------------------------
-struct WizardsVaultObjective
-{
-    int         id          = 0;
-    std::string title;
-    int         progressCurrent = 0;
-    int         progressComplete = 0;    // total required
-    bool        claimed     = false;
-
-    CompletionState GetState() const
-    {
-        if (progressCurrent >= progressComplete && progressComplete > 0)
-            return CompletionState::Complete;
-        return CompletionState::Incomplete;
-    }
-};
-
-// -------------------------------------------------------------------------
 // World boss entry
 // -------------------------------------------------------------------------
 struct WorldBossEntry
@@ -53,13 +34,40 @@ struct WorldBossEntry
 };
 
 // -------------------------------------------------------------------------
-// Home instance node
+// Ley-Line Anomaly
 // -------------------------------------------------------------------------
-struct HomeNode
+// The Ley-Line Anomaly has no API endpoint of its own. It rotates through
+// three maps on a fixed, hardcoded schedule (sourced from the GW2 wiki):
+// it appears in a different map every 2 hours, and returns to the same map
+// every 6 hours. We detect completion heuristically: if the player was in
+// the correct map during the ~20-minute event window, and their count of
+// Mystic Coins (19976) or Crystallized Ley-Energy (79047) increased over
+// that window, we consider the event completed for that occurrence.
+struct LeyLineAnomalySpot
 {
-    std::string id;             // e.g. "quartz_crystal"
-    std::string name;           // e.g. "Quartz Crystal Formation"
-    CompletionState completion  = CompletionState::Unknown;
+    int         mapId = 0;
+    std::string mapName;
+    int         spawnUtcSec = 0;   // seconds from midnight UTC
+};
+
+// Returns the built-in Ley-Line Anomaly rotation (sorted by spawnUtcSec).
+const std::vector<LeyLineAnomalySpot>& GetLeyLineAnomalySchedule();
+
+// Item IDs whose count increasing (while in the correct map, during the
+// event window) we treat as a signal that the Ley-Line Anomaly was
+// completed. See ResponseParser / DataStore for the detection logic.
+inline constexpr int kItemIdMysticCoin             = 19976;
+inline constexpr int kItemIdCrystallizedLeyEnergy  = 79047;
+
+struct LeyLineAnomalyState
+{
+    // Whether today's "current cycle" occurrence has been detected as done.
+    CompletionState completion = CompletionState::Unknown;
+
+    // The next upcoming occurrence (earliest), as seconds-from-midnight UTC.
+    int nextSpawnUtcSec = -1;
+    std::string nextMapName;
+    int nextMapId = 0;
 };
 
 // -------------------------------------------------------------------------
@@ -77,19 +85,16 @@ struct MapChest
 // -------------------------------------------------------------------------
 struct DailySnapshot
 {
-    std::vector<WizardsVaultObjective>  wizardsVault;
     std::vector<WorldBossEntry>         worldBosses;
-    std::vector<HomeNode>               homeNodes;
     std::vector<MapChest>               mapChests;
+    LeyLineAnomalyState                 leyLineAnomaly;
 
     // Timestamp when data was last refreshed
     std::chrono::system_clock::time_point lastRefreshed;
 
     bool IsEmpty() const
     {
-        return wizardsVault.empty()
-            && worldBosses.empty()
-            && homeNodes.empty()
+        return worldBosses.empty()
             && mapChests.empty();
     }
 };
@@ -107,10 +112,9 @@ struct AddonSettings
     int refreshIntervalSec = 300;
 
     // Category visibility
-    bool showWizardsVault   = true;
     bool showWorldBosses    = true;
-    bool showHomeNodes      = true;
     bool showMapChests      = true;
+    bool showLeyLineAnomaly = true;
 
     // Window state
     bool windowVisible      = false;
@@ -132,7 +136,7 @@ struct WorldBossScheduleEntry
 {
     const char* id;
     const char* displayName;
-    int         spawnTimesUtcSec[8];   // up to 8 spawns; 0-terminated
+    int         spawnTimesUtcSec[9];   // up to 8 spawns; -1-terminated
 };
 
 // Returns the built-in schedule table (null-terminated array)

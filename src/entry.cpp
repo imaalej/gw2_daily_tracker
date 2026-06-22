@@ -1,4 +1,5 @@
 #include "nexus/Nexus.h"
+#include "mumble/Mumble.h"
 #include "imgui/imgui.h"
 #include "core/DataTypes.h"
 #include "core/Cache.h"
@@ -14,6 +15,8 @@
 #include <filesystem>
 #include <atomic>
 #include <mutex>
+#include <thread>
+#include <curl/curl.h>
 
 namespace DailyTracker
 {
@@ -114,6 +117,43 @@ static void DrawCompletionIcon(CompletionState state)
 }
 
 // ---------------------------------------------------------------------------
+// Mumble link access (current map ID + active character name), needed for
+// Ley-Line Anomaly detection. DL_MUMBLE_LINK gives us Mumble::Data, whose
+// Context.MapID is the player's current map, and whose Identity (delivered
+// separately via DL_MUMBLE_LINK_IDENTITY, or embedded depending on Nexus
+// version) gives the active character's name. Nexus exposes the parsed
+// identity directly via DataLink_Get(DL_MUMBLE_LINK_IDENTITY).
+// ---------------------------------------------------------------------------
+static bool GetCurrentMapAndCharacter(int& outMapId, std::string& outCharacterName)
+{
+    outMapId = -1;
+    outCharacterName.clear();
+
+    if (!g_nexus || !g_nexus->DataLink_Get)
+        return false;
+
+    void* mumbleData = g_nexus->DataLink_Get(DL_MUMBLE_LINK);
+    if (mumbleData)
+    {
+        auto* data = static_cast<Mumble::Data*>(mumbleData);
+        outMapId = static_cast<int>(data->Context.MapID);
+    }
+
+    void* identityData = g_nexus->DataLink_Get(DL_MUMBLE_LINK_IDENTITY);
+    if (identityData)
+    {
+        auto* identity = static_cast<Mumble::Identity*>(identityData);
+        // Name is a fixed-size char buffer; guard against missing
+        // null-termination from the shared-memory link.
+        char nameBuf[sizeof(identity->Name) + 1] = {};
+        std::memcpy(nameBuf, identity->Name, sizeof(identity->Name));
+        outCharacterName = nameBuf;
+    }
+
+    return outMapId >= 0 && !outCharacterName.empty();
+}
+
+// ---------------------------------------------------------------------------
 // Forward declarations for render callbacks
 // ---------------------------------------------------------------------------
 static void AddonRender();
@@ -168,45 +208,6 @@ static void RenderStatusBar()
         g_dataStore->ForceRefresh();
 }
 
-static void RenderWizardsVault(const DailySnapshot& snap)
-{
-    if (!ImGui::CollapsingHeader("Wizard's Vault", ImGuiTreeNodeFlags_DefaultOpen))
-        return;
-
-    if (snap.wizardsVault.empty())
-    {
-        ImGui::TextDisabled("No data available.");
-        return;
-    }
-
-    for (const auto& obj : snap.wizardsVault)
-    {
-        CompletionState state = obj.GetState();
-        DrawCompletionIcon(state);
-        ImGui::SameLine();
-
-        float fraction = 0.0f;
-        if (obj.progressComplete > 0)
-            fraction = static_cast<float>(obj.progressCurrent) /
-                       static_cast<float>(obj.progressComplete);
-        if (fraction > 1.0f) fraction = 1.0f;
-        if (fraction < 0.0f) fraction = 0.0f;
-
-        ImGui::Text("%s", obj.title.c_str());
-
-        char overlay[64];
-        std::snprintf(overlay, sizeof(overlay), "%d / %d",
-                      obj.progressCurrent, obj.progressComplete);
-
-        ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f), overlay);
-
-        if (obj.claimed)
-            ImGui::TextDisabled("  (claimed)");
-
-        ImGui::Spacing();
-    }
-}
-
 static void RenderWorldBosses(const DailySnapshot& snap)
 {
     if (!ImGui::CollapsingHeader("World Bosses", ImGuiTreeNodeFlags_DefaultOpen))
@@ -246,25 +247,31 @@ static void RenderWorldBosses(const DailySnapshot& snap)
     }
 }
 
-static void RenderHomeNodes(const DailySnapshot& snap)
+static void RenderLeyLineAnomaly(const DailySnapshot& snap)
 {
-    if (!ImGui::CollapsingHeader("Home Instance Nodes", ImGuiTreeNodeFlags_DefaultOpen))
+    if (!ImGui::CollapsingHeader("Ley-Line Anomaly", ImGuiTreeNodeFlags_DefaultOpen))
         return;
 
-    if (snap.homeNodes.empty())
+    const auto& ll = snap.leyLineAnomaly;
+
+    if (ll.nextSpawnUtcSec < 0)
     {
         ImGui::TextDisabled("No data available.");
         return;
     }
 
-    ImGui::TextDisabled("Harvest status is not exposed by the GW2 API.");
+    DrawCompletionIcon(ll.completion);
+    ImGui::SameLine();
+    ImGui::Text("Next: %s", ll.nextMapName.c_str());
 
-    for (const auto& node : snap.homeNodes)
-    {
-        DrawCompletionIcon(node.completion);
-        ImGui::SameLine();
-        ImGui::TextUnformatted(node.name.c_str());
-    }
+    std::time_t nowUtc = std::time(nullptr);
+    int secondsToday = static_cast<int>(nowUtc % 86400);
+    int diff = ll.nextSpawnUtcSec - secondsToday;
+    if (diff < 0)
+        diff += 86400;
+
+    ImGui::Text("Spawns in: %s", FormatCountdown(diff).c_str());
+    ImGui::TextDisabled("Detected heuristically via map + item-count tracking.");
 }
 
 static void RenderMapChests(const DailySnapshot& snap)
@@ -291,6 +298,13 @@ static void AddonRender()
     // Drive refresh / daily-reset logic and data-updated callback on main thread.
     g_dataStore->Tick();
 
+    // Ley-Line Anomaly detection needs the player's current map + active
+    // character every frame, regardless of whether the window is visible.
+    int currentMapId = -1;
+    std::string currentCharacterName;
+    GetCurrentMapAndCharacter(currentMapId, currentCharacterName);
+    g_dataStore->TickLeyLineAnomaly(currentMapId, currentCharacterName);
+
     AddonSettings& settings = g_settings->Get();
     if (!settings.windowVisible)
         return;
@@ -303,10 +317,9 @@ static void AddonRender()
     {
         DailySnapshot snap = g_dataStore->GetSnapshot();
 
-        if (settings.showWizardsVault) RenderWizardsVault(snap);
-        if (settings.showWorldBosses)  RenderWorldBosses(snap);
-        if (settings.showHomeNodes)    RenderHomeNodes(snap);
-        if (settings.showMapChests)    RenderMapChests(snap);
+        if (settings.showLeyLineAnomaly) RenderLeyLineAnomaly(snap);
+        if (settings.showWorldBosses)    RenderWorldBosses(snap);
+        if (settings.showMapChests)      RenderMapChests(snap);
 
         RenderStatusBar();
 
@@ -339,7 +352,7 @@ static void AddonOptionsRender()
 
     // ---- API key ----
     ImGui::TextUnformatted("GW2 API Key");
-    ImGui::TextDisabled("Requires scopes: account, progression, unlocks");
+    ImGui::TextDisabled("Requires scopes: account, progression, unlocks, inventories");
 
     if (ImGui::InputText("##apikey", g_apiKeyBuffer, sizeof(g_apiKeyBuffer),
                           ImGuiInputTextFlags_Password))
@@ -368,9 +381,61 @@ static void AddonOptionsRender()
             g_apiKeyTestMsg = "Testing...";
         }
 
-        // Use a lightweight authenticated endpoint to validate the key.
-        g_api->Get("/v2/account", true, settings.language,
-            [](ApiResult res)
+        // Run the test on a short-lived dedicated thread so it never
+        // competes with pending data-fetch tasks in the APIManager queue.
+        std::string keyToTest = std::string(g_apiKeyBuffer);
+        std::thread([keyToTest]()
+        {
+            // Perform a minimal direct curl request without going through
+            // the shared APIManager queue.
+            std::string url = std::string(APIManager::kBaseUrl) + "/v2/account";
+            CURL* curl = curl_easy_init();
+            ApiResult res;
+            if (curl)
+            {
+                std::string body;
+                curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+                curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+                curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+                curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+                curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+                curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+                curl_easy_setopt(curl, CURLOPT_USERAGENT,
+                    "GW2-DailyTracker/1.0 (Nexus addon; test)");
+
+                auto writeData = +[](char* ptr, size_t sz, size_t nm, void* ud) -> size_t {
+                    static_cast<std::string*>(ud)->append(ptr, sz * nm);
+                    return sz * nm;
+                };
+                curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeData);
+                curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+
+                curl_slist* hdrs = nullptr;
+                if (!keyToTest.empty())
+                {
+                    std::string auth = "Authorization: Bearer " + keyToTest;
+                    hdrs = curl_slist_append(hdrs, auth.c_str());
+                    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+                }
+
+                CURLcode rc = curl_easy_perform(curl);
+                long http = 0;
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
+                curl_slist_free_all(hdrs);
+                curl_easy_cleanup(curl);
+
+                res.httpStatus = static_cast<int>(http);
+                if (rc == CURLE_OK && http == 200)
+                    res.success = true;
+                else if (rc != CURLE_OK)
+                    res.errorMessage = curl_easy_strerror(rc);
+            }
+            else
+            {
+                res.errorMessage = "curl_easy_init failed";
+            }
+
             {
                 std::lock_guard<std::mutex> lock(g_testMsgMutex);
                 if (res.success)
@@ -379,9 +444,9 @@ static void AddonOptionsRender()
                     g_apiKeyTestMsg = "Invalid key or insufficient permissions.";
                 else
                     g_apiKeyTestMsg = "Error: " + res.errorMessage;
-
-                g_apiKeyTestInFlight = false;
-            });
+            }
+            g_apiKeyTestInFlight = false;
+        }).detach();
     }
 
     {
@@ -411,9 +476,8 @@ static void AddonOptionsRender()
     ImGui::TextUnformatted("Visible Categories");
 
     bool changed = false;
-    changed |= ImGui::Checkbox("Wizard's Vault", &settings.showWizardsVault);
-    changed |= ImGui::Checkbox("World Bosses",   &settings.showWorldBosses);
-    changed |= ImGui::Checkbox("Home Instance Nodes", &settings.showHomeNodes);
+    changed |= ImGui::Checkbox("Ley-Line Anomaly",    &settings.showLeyLineAnomaly);
+    changed |= ImGui::Checkbox("World Bosses",         &settings.showWorldBosses);
     changed |= ImGui::Checkbox("Hero's Choice Chests", &settings.showMapChests);
 
     if (changed)

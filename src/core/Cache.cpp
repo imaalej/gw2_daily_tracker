@@ -1,6 +1,7 @@
 #include "Cache.h"
 #include <fstream>
 #include <iomanip>
+#include <mutex>
 
 namespace DailyTracker
 {
@@ -11,6 +12,7 @@ Cache::Cache(const std::filesystem::path& addonDir)
 
 void Cache::Load()
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     if (!std::filesystem::exists(m_cachePath))
         return;
 
@@ -24,6 +26,7 @@ void Cache::Load()
 
 void Cache::Save() const
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     std::filesystem::create_directories(m_cachePath.parent_path());
     std::ofstream file(m_cachePath);
     if (file.is_open())
@@ -33,6 +36,7 @@ void Cache::Save() const
 void Cache::Set(const std::string& key, const nlohmann::json& value,
                 std::chrono::system_clock::time_point expiresAt)
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     auto expiresUnix = std::chrono::duration_cast<std::chrono::seconds>(
         expiresAt.time_since_epoch()).count();
 
@@ -53,8 +57,9 @@ void Cache::SetWithTTL(const std::string& key, const nlohmann::json& value,
     Set(key, value, std::chrono::system_clock::now() + ttl);
 }
 
-bool Cache::Get(const std::string& key, nlohmann::json& outValue) const
+bool Cache::Get(const std::string& key, nlohmann::json& outValue, bool ignoreTTL) const
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     auto it = m_data.find(key);
     if (it == m_data.end())
         return false;
@@ -63,12 +68,15 @@ bool Cache::Get(const std::string& key, nlohmann::json& outValue) const
     if (!entry.contains("expires_unix") || !entry.contains("value"))
         return false;
 
-    auto expiresUnix = entry["expires_unix"].get<int64_t>();
-    auto nowUnix = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (!ignoreTTL)
+    {
+        auto expiresUnix = entry["expires_unix"].get<int64_t>();
+        auto nowUnix = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
 
-    if (nowUnix >= expiresUnix)
-        return false; // expired
+        if (nowUnix >= expiresUnix)
+            return false;
+    }
 
     outValue = entry["value"];
     return true;
@@ -76,18 +84,19 @@ bool Cache::Get(const std::string& key, nlohmann::json& outValue) const
 
 void Cache::Invalidate(const std::string& key)
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     m_data.erase(key);
 }
 
 void Cache::InvalidateAll()
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     m_data = nlohmann::json::object();
 }
 
 std::chrono::system_clock::time_point
 Cache::NextDailyReset(std::chrono::system_clock::time_point from)
 {
-    // GW2 daily reset is 00:00 UTC
     auto fromTime = std::chrono::system_clock::to_time_t(from);
     std::tm utcTm{};
 #ifdef _WIN32
@@ -95,7 +104,6 @@ Cache::NextDailyReset(std::chrono::system_clock::time_point from)
 #else
     gmtime_r(&fromTime, &utcTm);
 #endif
-    // Advance to next midnight UTC
     utcTm.tm_hour = 0;
     utcTm.tm_min  = 0;
     utcTm.tm_sec  = 0;
