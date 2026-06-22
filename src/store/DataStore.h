@@ -118,6 +118,10 @@ private:
     std::atomic<int>   m_leyLineBaselineCount { -1 };
     bool               m_leyLineSeenCorrectMap = false;
     std::atomic<bool>  m_leyLineSampleInFlight{ false };
+
+    // Throttle for TickLeyLineAnomaly: accessed on the main (render) thread only.
+    // Prevents flooding the task queue at 60fps when the player is in-game.
+    std::chrono::steady_clock::time_point m_lastLeyLineTick{};
 };
 
 } // namespace DailyTracker

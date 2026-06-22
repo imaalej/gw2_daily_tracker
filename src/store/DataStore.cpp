@@ -71,15 +71,15 @@ void DataStore::Initialize()
     // Start the background thread
     m_backgroundThread = std::thread(&DataStore::BackgroundLoop, this);
 
+    // Populate Ley-Line next-occurrence data first so it is ready as soon
+    // as the window opens, regardless of whether a network fetch is needed.
+    PostTask([this]() { LeyLine_RefreshNextOccurrence(); });
+
     // Post initial fetch if key is present
     if (m_settings.HasApiKey())
         PostTask([this]() { BeginFetch(); });
     else
         SetStatus(FetchStatus::NoApiKey, "Enter your GW2 API key in Settings");
-
-    // Populate Ley-Line next-occurrence data immediately on startup so the
-    // section shows a countdown even before the player enters a map.
-    PostTask([this]() { LeyLine_RefreshNextOccurrence(); });
 }
 
 void DataStore::Tick()
@@ -708,8 +708,21 @@ void DataStore::LeyLine_EndWindowSample(const std::string& characterName)
 // ---------------------------------------------------------------------------
 void DataStore::TickLeyLineAnomaly(int currentMapId, const std::string& currentCharacterName)
 {
+    // Guard BEFORE PostTask: never flood the task queue.
+    // Without this, every rendered frame would queue a background task
+    // (60+ tasks/second), starving the APIManager queue and stalling fetches.
     if (!m_settings.HasApiKey() || currentCharacterName.empty())
         return;
+
+    // Throttle: post at most once per second to avoid drowning the queue.
+    {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           now - m_lastLeyLineTick).count();
+        if (elapsed < 1000)
+            return;
+        m_lastLeyLineTick = now;
+    }
 
     PostTask([this, currentMapId, currentCharacterName]()
     {

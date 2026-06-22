@@ -15,6 +15,8 @@
 #include <filesystem>
 #include <atomic>
 #include <mutex>
+#include <thread>
+#include <curl/curl.h>
 
 namespace DailyTracker
 {
@@ -379,9 +381,61 @@ static void AddonOptionsRender()
             g_apiKeyTestMsg = "Testing...";
         }
 
-        // Use a lightweight authenticated endpoint to validate the key.
-        g_api->Get("/v2/account", true, settings.language,
-            [](ApiResult res)
+        // Run the test on a short-lived dedicated thread so it never
+        // competes with pending data-fetch tasks in the APIManager queue.
+        std::string keyToTest = std::string(g_apiKeyBuffer);
+        std::thread([keyToTest]()
+        {
+            // Perform a minimal direct curl request without going through
+            // the shared APIManager queue.
+            std::string url = std::string(APIManager::kBaseUrl) + "/v2/account";
+            CURL* curl = curl_easy_init();
+            ApiResult res;
+            if (curl)
+            {
+                std::string body;
+                curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+                curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+                curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+                curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+                curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+                curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+                curl_easy_setopt(curl, CURLOPT_USERAGENT,
+                    "GW2-DailyTracker/1.0 (Nexus addon; test)");
+
+                auto writeData = +[](char* ptr, size_t sz, size_t nm, void* ud) -> size_t {
+                    static_cast<std::string*>(ud)->append(ptr, sz * nm);
+                    return sz * nm;
+                };
+                curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeData);
+                curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+
+                curl_slist* hdrs = nullptr;
+                if (!keyToTest.empty())
+                {
+                    std::string auth = "Authorization: Bearer " + keyToTest;
+                    hdrs = curl_slist_append(hdrs, auth.c_str());
+                    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+                }
+
+                CURLcode rc = curl_easy_perform(curl);
+                long http = 0;
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
+                curl_slist_free_all(hdrs);
+                curl_easy_cleanup(curl);
+
+                res.httpStatus = static_cast<int>(http);
+                if (rc == CURLE_OK && http == 200)
+                    res.success = true;
+                else if (rc != CURLE_OK)
+                    res.errorMessage = curl_easy_strerror(rc);
+            }
+            else
+            {
+                res.errorMessage = "curl_easy_init failed";
+            }
+
             {
                 std::lock_guard<std::mutex> lock(g_testMsgMutex);
                 if (res.success)
@@ -390,9 +444,9 @@ static void AddonOptionsRender()
                     g_apiKeyTestMsg = "Invalid key or insufficient permissions.";
                 else
                     g_apiKeyTestMsg = "Error: " + res.errorMessage;
-
-                g_apiKeyTestInFlight = false;
-            });
+            }
+            g_apiKeyTestInFlight = false;
+        }).detach();
     }
 
     {
