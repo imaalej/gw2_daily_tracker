@@ -75,7 +75,7 @@ bool Cache::Get(const std::string& key, nlohmann::json& outValue, bool ignoreTTL
             std::chrono::system_clock::now().time_since_epoch()).count();
 
         if (nowUnix >= expiresUnix)
-            return false; // expired
+            return false;
     }
 
     outValue = entry["value"];
@@ -97,7 +97,6 @@ void Cache::InvalidateAll()
 std::chrono::system_clock::time_point
 Cache::NextDailyReset(std::chrono::system_clock::time_point from)
 {
-    // GW2 daily reset is 00:00 UTC
     auto fromTime = std::chrono::system_clock::to_time_t(from);
     std::tm utcTm{};
 #ifdef _WIN32
@@ -105,7 +104,6 @@ Cache::NextDailyReset(std::chrono::system_clock::time_point from)
 #else
     gmtime_r(&fromTime, &utcTm);
 #endif
-    // Advance to next midnight UTC
     utcTm.tm_hour = 0;
     utcTm.tm_min  = 0;
     utcTm.tm_sec  = 0;

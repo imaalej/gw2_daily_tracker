@@ -5,26 +5,22 @@
 #include <memory>
 #include <ctime>
 #include <climits>
+#include <future>
+#include <algorithm>
 
 namespace DailyTracker
 {
 
-// Forward declaration matching entry.cpp / APIManager.cpp.
+// Forward declaration for logging
 void LogMessage(int level, const std::string& channel, const std::string& message);
 
-// Cache keys
-static constexpr const char* k_cacheBosses     = "world_bosses";
-static constexpr const char* k_cacheBossesMeta = "world_bosses_meta";
-static constexpr const char* k_cacheMapChests  = "map_chests";
+// Cache keys – defined only here, not in header
+static constexpr const char* k_cacheBosses        = "world_bosses";
+static constexpr const char* k_cacheBossesMeta    = "world_bosses_meta";
+static constexpr const char* k_cacheMapChests     = "map_chests";
 static constexpr const char* k_cacheMapChestsMeta = "map_chests_meta";
 
-// How long m_fetchInFlight may remain true before we consider the fetch
-// stalled and force a hard reset (see Tick()'s safety heartbeat below).
 static constexpr auto k_fetchStallTimeout = std::chrono::seconds(60);
-
-// Ley-Line Anomaly event window: the addon starts watching for the map
-// change ~1 minute before the spawn, and the event itself is considered
-// active for ~20 minutes afterward (per the design doc).
 static constexpr int k_leyLinePreWindowSec  = 60;
 static constexpr int k_leyLineEventLenSec   = 20 * 60;
 
@@ -35,9 +31,17 @@ DataStore::DataStore(Cache& cache, Settings& settings, APIManager& api)
     m_nextDailyReset = Cache::NextDailyReset();
 }
 
+DataStore::~DataStore()
+{
+    m_stopBackground = true;
+    m_queueCv.notify_all();
+    if (m_backgroundThread.joinable())
+        m_backgroundThread.join();
+}
+
 void DataStore::Initialize()
 {
-    // Try to populate from cache first for instant UI on startup
+    // Load cache on main thread (quick, just reads a few JSON entries without heavy I/O)
     DailySnapshot snap;
     nlohmann::json cached;
 
@@ -64,66 +68,34 @@ void DataStore::Initialize()
         SetStatus(FetchStatus::Ok, "Loaded from cache");
     }
 
-    LeyLine_RefreshNextOccurrence();
+    // Start the background thread
+    m_backgroundThread = std::thread(&DataStore::BackgroundLoop, this);
 
-    // If no API key yet, don't kick off a network fetch
-    if (!m_settings.HasApiKey())
-    {
+    // Post initial fetch if key is present
+    if (m_settings.HasApiKey())
+        PostTask([this]() { BeginFetch(); });
+    else
         SetStatus(FetchStatus::NoApiKey, "Enter your GW2 API key in Settings");
-        return;
-    }
-
-    BeginFetch();
 }
 
-// ---------------------------------------------------------------------------
 void DataStore::Tick()
 {
-    // Check for daily reset
-    CheckDailyReset();
-
-    auto now = std::chrono::system_clock::now();
-
-    // Safety heartbeat: if a fetch has been "in flight" for too long, one
-    // of the async steps likely never called back (worker thread crash,
-    // discarded callback, or a step that decremented incorrectly). Force a
-    // hard reset rather than leaving the UI stuck on "Refreshing..." and
-    // the Refresh Now button permanently inert.
-    if (m_fetchInFlight.load())
-    {
-        auto stalledFor = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFetchTime);
-        if (stalledFor > k_fetchStallTimeout)
-        {
-            LogMessage(3, "DailyTracker", "Fetch stalled - forcing reset");
-            m_fetchInFlight = false;
-            m_pendingSteps  = 0;
-            SetStatus(FetchStatus::NetworkError, "Fetch timed out - try again");
-        }
-    }
-
-    // Auto-refresh
-    auto interval = std::chrono::seconds(m_settings.Get().refreshIntervalSec);
-    bool overdue  = (now - m_lastFetchTime) >= interval;
-
-    if (overdue && !m_fetchInFlight.load() && m_settings.HasApiKey())
-        BeginFetch();
-
-    // Fire data-updated callback if flagged
+    // Check for data update flag and fire callback
     if (m_dataUpdated.exchange(false) && m_onDataUpdated)
         m_onDataUpdated();
 }
 
 void DataStore::ForceRefresh()
 {
-    if (!m_fetchInFlight.load())
-        BeginFetch();
+    if (m_settings.HasApiKey())
+        PostTask([this]() { BeginFetch(); });
 }
 
 void DataStore::OnApiKeyChanged()
 {
     m_api.SetApiKey(m_settings.ApiKey());
     if (m_settings.HasApiKey())
-        BeginFetch();
+        PostTask([this]() { BeginFetch(); });
     else
         SetStatus(FetchStatus::NoApiKey, "Enter your GW2 API key in Settings");
 }
@@ -145,6 +117,36 @@ std::string DataStore::GetStatusMessage() const
 {
     std::lock_guard<std::mutex> lk(m_statusMsgMtx);
     return m_statusMessage;
+}
+
+// ---------------------------------------------------------------------------
+// Background thread loop
+// ---------------------------------------------------------------------------
+void DataStore::BackgroundLoop()
+{
+    while (!m_stopBackground)
+    {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lk(m_queueMtx);
+            m_queueCv.wait(lk, [this] { return !m_taskQueue.empty() || m_stopBackground; });
+            if (m_stopBackground && m_taskQueue.empty())
+                break;
+            task = std::move(m_taskQueue.front());
+            m_taskQueue.pop();
+        }
+        if (task)
+            task();
+    }
+}
+
+void DataStore::PostTask(std::function<void()> task)
+{
+    {
+        std::lock_guard<std::mutex> lk(m_queueMtx);
+        m_taskQueue.push(std::move(task));
+    }
+    m_queueCv.notify_one();
 }
 
 // ---------------------------------------------------------------------------
@@ -177,39 +179,35 @@ void DataStore::DecrementAndFinalize(const char* stepName)
     }
     else if (newVal < 0)
     {
-        // Guard against double-decrement: if some step incorrectly
-        // decrements more than once, pendingSteps could go negative and
-        // FinalizeFetch() (which only fires on == 0) would never run,
-        // leaving the fetch stuck "in flight" forever.
         LogMessage(3, "DailyTracker", "Warning: pendingSteps went negative! Resetting.");
         m_pendingSteps = 0;
         FinalizeFetch();
     }
 }
 
-// ---------------------------------------------------------------------------
 void DataStore::CheckDailyReset()
 {
     auto now = std::chrono::system_clock::now();
     if (now >= m_nextDailyReset)
     {
+        LogMessage(2, "DailyTracker", "Daily reset detected – invalidating cache.");
         m_cache.InvalidateAll();
         m_cache.Save();
         m_nextDailyReset = Cache::NextDailyReset(now);
-
-        // Force immediate refresh after reset
-        if (!m_fetchInFlight.load() && m_settings.HasApiKey())
-            BeginFetch();
+        m_pendingReset = false;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Fetch orchestration
+// Fetch orchestration (all run on background thread)
 // ---------------------------------------------------------------------------
 void DataStore::BeginFetch()
 {
     if (m_fetchInFlight.exchange(true))
         return;
+
+    // Check for daily reset before fetching
+    CheckDailyReset();
 
     m_anyStepFailed.store(false);
     m_pendingSteps  = kTotalFetchSteps;
@@ -218,7 +216,6 @@ void DataStore::BeginFetch()
 
     LogMessage(2, "DailyTracker", "BeginFetch: starting fetch cycle");
 
-    // Clear pending data (mutex stays unchanged)
     {
         std::lock_guard<std::mutex> lk(m_pending.mtx);
         m_pending.worldBosses.clear();
@@ -229,6 +226,8 @@ void DataStore::BeginFetch()
     FetchStep_MapChestsMeta();
 }
 
+// ---------------------------------------------------------------------------
+// World Boss Completion
 // ---------------------------------------------------------------------------
 void DataStore::FetchStep_WorldBossCompletion()
 {
@@ -259,12 +258,8 @@ void DataStore::FetchStep_WorldBossCompletion()
     {
         if (!res.success)
         {
-            // Non-fatal for the "No data available" case: fall back to a
-            // stale completion cache (ignoring TTL) rather than treating
-            // the whole category as empty. Completion data resets daily so
-            // a slightly-stale list is still meaningful information.
             nlohmann::json staleCompletion;
-            if (m_cache.Get(k_cacheBosses, staleCompletion, true /* ignoreTTL */))
+            if (m_cache.Get(k_cacheBosses, staleCompletion, true))
             {
                 LogMessage(3, "DailyTracker", "Using stale completion cache for world bosses");
                 try
@@ -302,6 +297,9 @@ void DataStore::FetchStep_WorldBossCompletion()
     });
 }
 
+// ---------------------------------------------------------------------------
+// World Boss Meta
+// ---------------------------------------------------------------------------
 void DataStore::FetchStep_WorldBossMeta(std::set<std::string> completedIds)
 {
     LogMessage(2, "DailyTracker", "FetchStep_WorldBossMeta: starting");
@@ -329,13 +327,8 @@ void DataStore::FetchStep_WorldBossMeta(std::set<std::string> completedIds)
     {
         if (!res.success)
         {
-            // Use Stale Cache as Fallback: rather than falling back to an
-            // empty list (which the UI renders as "No data available"),
-            // attempt to read the metadata cache while ignoring its TTL.
-            // This keeps the boss list visible during a transient API
-            // outage instead of blanking the whole section.
             nlohmann::json staleMeta;
-            if (m_cache.Get(k_cacheBossesMeta, staleMeta, true /* ignoreTTL */))
+            if (m_cache.Get(k_cacheBossesMeta, staleMeta, true))
             {
                 LogMessage(3, "DailyTracker", "Using stale metadata for world bosses");
                 try
@@ -350,27 +343,22 @@ void DataStore::FetchStep_WorldBossMeta(std::set<std::string> completedIds)
                 {
                     LogMessage(3, "DailyTracker",
                         std::string("Stale metadata parse error (world bosses): ") + e.what());
-                    // fall through to the empty fallback below
                 }
             }
 
-            // Truly no data available (no live response, no usable cache):
-            // still surface bosses with fallback (prettified-ID) names so
-            // the player at least sees something rather than a blank list.
             try
             {
                 std::lock_guard<std::mutex> lk(m_pending.mtx);
                 m_pending.worldBosses = ResponseParser::ParseWorldBossMeta(
                     nlohmann::json::array(), completedIds);
             }
-            catch (const std::exception&) { /* nothing more we can do */ }
+            catch (const std::exception&) { }
             DecrementAndFinalize("WorldBossMeta(empty-fallback)");
             return;
         }
 
         try
         {
-            // Meta doesn't change daily, use a 24-hour TTL
             m_cache.SetWithTTL(k_cacheBossesMeta, res.body, std::chrono::hours(24));
             auto bosses = ResponseParser::ParseWorldBossMeta(res.body, completedIds);
             std::lock_guard<std::mutex> lk(m_pending.mtx);
@@ -385,6 +373,8 @@ void DataStore::FetchStep_WorldBossMeta(std::set<std::string> completedIds)
     });
 }
 
+// ---------------------------------------------------------------------------
+// Map Chests Meta
 // ---------------------------------------------------------------------------
 void DataStore::FetchStep_MapChestsMeta()
 {
@@ -407,11 +397,8 @@ void DataStore::FetchStep_MapChestsMeta()
     {
         if (!res.success)
         {
-            // Stale cache as fallback (same pattern as world bosses): show
-            // last-known chest metadata rather than "No data available"
-            // during a transient outage.
             nlohmann::json staleMeta;
-            if (m_cache.Get(k_cacheMapChestsMeta, staleMeta, true /* ignoreTTL */))
+            if (m_cache.Get(k_cacheMapChestsMeta, staleMeta, true))
             {
                 LogMessage(3, "DailyTracker", "Using stale metadata for map chests");
                 doCompletion(std::move(staleMeta));
@@ -425,6 +412,9 @@ void DataStore::FetchStep_MapChestsMeta()
     });
 }
 
+// ---------------------------------------------------------------------------
+// Map Chests Completion
+// ---------------------------------------------------------------------------
 void DataStore::FetchStep_MapChestsCompletion(nlohmann::json metaJson)
 {
     LogMessage(2, "DailyTracker", "FetchStep_MapChestsCompletion: starting");
@@ -452,7 +442,7 @@ void DataStore::FetchStep_MapChestsCompletion(nlohmann::json metaJson)
         if (!res.success)
         {
             nlohmann::json staleCompletion;
-            if (m_cache.Get(k_cacheMapChests, staleCompletion, true /* ignoreTTL */))
+            if (m_cache.Get(k_cacheMapChests, staleCompletion, true))
             {
                 LogMessage(3, "DailyTracker", "Using stale completion cache for map chests");
                 try
@@ -495,26 +485,22 @@ void DataStore::FetchStep_MapChestsCompletion(nlohmann::json metaJson)
 }
 
 // ---------------------------------------------------------------------------
-// Called when all async steps finish (pendingSteps reaches 0)
+// Finalize Fetch – called when all steps complete
 // ---------------------------------------------------------------------------
 void DataStore::FinalizeFetch()
 {
-    // CRITICAL: reset the in-flight flag before any operation that could throw.
     m_fetchInFlight = false;
     m_dataUpdated   = true;
 
     DailySnapshot snap;
     {
         std::lock_guard<std::mutex> lk(m_pending.mtx);
-        snap.worldBosses  = std::move(m_pending.worldBosses);
-        snap.mapChests    = std::move(m_pending.mapChests);
+        snap.worldBosses = std::move(m_pending.worldBosses);
+        snap.mapChests   = std::move(m_pending.mapChests);
     }
     snap.lastRefreshed = std::chrono::system_clock::now();
     {
         std::lock_guard<std::mutex> lk(m_snapshotMtx);
-        // Ley-Line Anomaly state is computed independently on the main
-        // thread (see TickLeyLineAnomaly); preserve it across this
-        // network-driven snapshot replacement instead of resetting it.
         snap.leyLineAnomaly = m_snapshot.leyLineAnomaly;
         m_snapshot = std::move(snap);
     }
@@ -524,7 +510,6 @@ void DataStore::FinalizeFetch()
 
     LogMessage(2, "DailyTracker", "FinalizeFetch: fetch cycle complete");
 
-    // Save cache – catch any exception so it doesn't skip the flag reset (already done).
     try {
         m_cache.Save();
     } catch (const std::exception& e) {
@@ -535,23 +520,7 @@ void DataStore::FinalizeFetch()
 }
 
 // ---------------------------------------------------------------------------
-// Ley-Line Anomaly tracking
-// ---------------------------------------------------------------------------
-// The Ley-Line Anomaly has no API endpoint of its own. We detect completion
-// heuristically:
-//   1. We know in advance, from the hardcoded rotation, which map and what
-//      UTC second each occurrence spawns at.
-//   2. Starting ~1 minute before that time, we watch the player's current
-//      map (from the Mumble link) and snapshot their count of Mystic Coins
-//      + Crystallized Ley-Energy (bank + material storage + this
-//      character's inventory) as a baseline.
-//   3. At the end of the ~20-minute event window, we re-sample the same
-//      item counts. If the player was seen in the correct map at any point
-//      during the window AND the combined count increased, we consider the
-//      occurrence completed.
-// For the UI we always show the earliest upcoming occurrence's map + ETA,
-// regardless of completion state (per the design doc: "simply show the
-// earliest next occurrence").
+// Ley-Line Anomaly helpers (run on background thread)
 // ---------------------------------------------------------------------------
 void DataStore::LeyLine_RefreshNextOccurrence()
 {
@@ -602,9 +571,8 @@ int DataStore::LeyLine_SumTrackedItems(const nlohmann::json& bank,
 void DataStore::LeyLine_BeginWindowSample(const std::string& characterName)
 {
     if (m_leyLineSampleInFlight.exchange(true))
-        return; // a sample is already pending; avoid piling up requests
+        return;
 
-    // Three independent async calls feeding one combined baseline.
     auto results = std::make_shared<std::array<nlohmann::json, 3>>();
     auto remaining = std::make_shared<std::atomic<int>>(3);
 
@@ -648,9 +616,6 @@ void DataStore::LeyLine_BeginWindowSample(const std::string& characterName)
 
 void DataStore::LeyLine_EndWindowSample(const std::string& characterName)
 {
-    // Always run the end sample – even if baseline is still in flight,
-    // we'll treat baseline == -1 as Unknown state.
-    // (The guard that was here has been removed.)
     auto results = std::make_shared<std::array<nlohmann::json, 3>>();
     auto remaining = std::make_shared<std::atomic<int>>(3);
     bool sawCorrectMap = m_leyLineSeenCorrectMap;
@@ -707,71 +672,69 @@ void DataStore::LeyLine_EndWindowSample(const std::string& characterName)
     });
 }
 
+// ---------------------------------------------------------------------------
+// Called from main thread – posts Ley-Line detection to background.
+// ---------------------------------------------------------------------------
 void DataStore::TickLeyLineAnomaly(int currentMapId, const std::string& currentCharacterName)
 {
     if (!m_settings.HasApiKey() || currentCharacterName.empty())
         return;
 
-    const auto& schedule = GetLeyLineAnomalySchedule();
-    if (schedule.empty())
-        return;
-
-    std::time_t nowUtc = std::time(nullptr);
-    int secondsToday = static_cast<int>(nowUtc % 86400);
-
-    // Find the occurrence whose window (spawn - preWindow .. spawn + eventLen)
-    // currently contains "now", if any. Schedule wraps at midnight UTC, so
-    // we check each spot against a wrapped delta.
-    const LeyLineAnomalySpot* activeSpot = nullptr;
-    for (const auto& spot : schedule)
+    PostTask([this, currentMapId, currentCharacterName]()
     {
-        int delta = secondsToday - spot.spawnUtcSec;
-        if (delta < -43200) delta += 86400;       // handle wrap near midnight
-        if (delta > 43200)  delta -= 86400;
+        const auto& schedule = GetLeyLineAnomalySchedule();
+        if (schedule.empty())
+            return;
 
-        if (delta >= -k_leyLinePreWindowSec && delta <= k_leyLineEventLenSec)
+        std::time_t nowUtc = std::time(nullptr);
+        int secondsToday = static_cast<int>(nowUtc % 86400);
+
+        const LeyLineAnomalySpot* activeSpot = nullptr;
+        for (const auto& spot : schedule)
         {
-            activeSpot = &spot;
-            break;
-        }
-    }
+            int delta = secondsToday - spot.spawnUtcSec;
+            if (delta < -43200) delta += 86400;
+            if (delta > 43200)  delta -= 86400;
 
-    if (activeSpot)
-    {
-        bool isNewOccurrence = (m_leyLinePhase == LeyLineWindowPhase::Idle)
-            || (m_leyLineActiveOccurrenceSec != activeSpot->spawnUtcSec);
-
-        if (isNewOccurrence)
-        {
-            // Entering a new window: reset tracking state and capture the
-            // "before" baseline immediately.
-            m_leyLinePhase                = LeyLineWindowPhase::Sampling;
-            m_leyLineActiveOccurrenceSec  = activeSpot->spawnUtcSec;
-            m_leyLineBaselineCount.store(-1);
-            m_leyLineSeenCorrectMap       = (currentMapId == activeSpot->mapId);
-
+            if (delta >= -k_leyLinePreWindowSec && delta <= k_leyLineEventLenSec)
             {
-                std::lock_guard<std::mutex> lk(m_snapshotMtx);
-                m_snapshot.leyLineAnomaly.completion = CompletionState::Unknown;
+                activeSpot = &spot;
+                break;
             }
-
-            LeyLine_BeginWindowSample(currentCharacterName);
         }
-        else if (currentMapId == activeSpot->mapId)
+
+        if (activeSpot)
         {
-            m_leyLineSeenCorrectMap = true;
-        }
-    }
-    else if (m_leyLinePhase == LeyLineWindowPhase::Sampling)
-    {
-        // The window we were tracking just ended; take the final sample
-        // and compute completion.
-        m_leyLinePhase = LeyLineWindowPhase::Idle;
-        LeyLine_EndWindowSample(currentCharacterName);
-    }
+            bool isNewOccurrence = (m_leyLinePhase == LeyLineWindowPhase::Idle)
+                || (m_leyLineActiveOccurrenceSec != activeSpot->spawnUtcSec);
 
-    // The "earliest next occurrence" display should always be fresh.
-    LeyLine_RefreshNextOccurrence();
+            if (isNewOccurrence)
+            {
+                m_leyLinePhase                = LeyLineWindowPhase::Sampling;
+                m_leyLineActiveOccurrenceSec  = activeSpot->spawnUtcSec;
+                m_leyLineBaselineCount.store(-1);
+                m_leyLineSeenCorrectMap       = (currentMapId == activeSpot->mapId);
+
+                {
+                    std::lock_guard<std::mutex> lk(m_snapshotMtx);
+                    m_snapshot.leyLineAnomaly.completion = CompletionState::Unknown;
+                }
+
+                LeyLine_BeginWindowSample(currentCharacterName);
+            }
+            else if (currentMapId == activeSpot->mapId)
+            {
+                m_leyLineSeenCorrectMap = true;
+            }
+        }
+        else if (m_leyLinePhase == LeyLineWindowPhase::Sampling)
+        {
+            m_leyLinePhase = LeyLineWindowPhase::Idle;
+            LeyLine_EndWindowSample(currentCharacterName);
+        }
+
+        LeyLine_RefreshNextOccurrence();
+    });
 }
 
 } // namespace DailyTracker
