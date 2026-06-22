@@ -14,13 +14,6 @@ class ResponseParser
 {
 public:
     // -----------------------------------------------------------------------
-    // /v2/account/wizardsvault/daily
-    // Returns an array of WizardsVaultObjective populated from the JSON.
-    // -----------------------------------------------------------------------
-    static std::vector<WizardsVaultObjective>
-        ParseWizardsVaultDaily(const nlohmann::json& j);
-
-    // -----------------------------------------------------------------------
     // /v2/account/worldbosses
     // Returns a set of boss IDs completed since the last daily reset.
     // -----------------------------------------------------------------------
@@ -32,18 +25,12 @@ public:
     // Returns a list of WorldBossEntry with names populated.
     // spawnTimesUtcSec is filled from the built-in schedule table.
     // completion is set by cross-referencing with ParseWorldBossCompletion().
+    // Any boss ID not found in the built-in schedule table is logged as a
+    // warning so missing/mismatched IDs can be identified and added.
     // -----------------------------------------------------------------------
     static std::vector<WorldBossEntry>
         ParseWorldBossMeta(const nlohmann::json& j,
                            const std::set<std::string>& completed);
-
-    // -----------------------------------------------------------------------
-    // /v2/account/home/nodes  +  /v2/home/nodes?ids=all
-    // Returns a list of HomeNode with names and completion status.
-    // -----------------------------------------------------------------------
-    static std::vector<HomeNode>
-        ParseHomeNodes(const nlohmann::json& metaJson,
-                       const nlohmann::json& completionJson);
 
     // -----------------------------------------------------------------------
     // /v2/account/mapchests  +  /v2/mapchests?ids=all
@@ -52,6 +39,20 @@ public:
     static std::vector<MapChest>
         ParseMapChests(const nlohmann::json& metaJson,
                        const nlohmann::json& completionJson);
+
+    // -----------------------------------------------------------------------
+    // /v2/account/bank, /v2/account/materials, /v2/characters/:id/inventory
+    // Each returns an array of (possibly null) { "id": int, "count": int }
+    // entries (materials/bank may omit "count" semantics differently, but
+    // all three share this minimal shape). Sums the count for a given item
+    // id across one such array. Safe on malformed/empty input (returns 0).
+    // -----------------------------------------------------------------------
+    static int SumItemCount(const nlohmann::json& itemArray, int itemId);
+
+    // Same as above, but for the nested bags->inventory shape returned by
+    // /v2/characters/:id/inventory.
+    static int SumCharacterInventoryItemCount(const nlohmann::json& inventoryJson,
+                                              int itemId);
 
 private:
     // Safely retrieves a value; returns defaultValue if missing or wrong type.

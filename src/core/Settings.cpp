@@ -46,14 +46,12 @@ bool Settings::Load()
         }
         if (j.contains("refresh_interval_sec"))
             m_settings.refreshIntervalSec = j["refresh_interval_sec"].get<int>();
-        if (j.contains("show_wizards_vault"))
-            m_settings.showWizardsVault  = j["show_wizards_vault"].get<bool>();
         if (j.contains("show_world_bosses"))
             m_settings.showWorldBosses   = j["show_world_bosses"].get<bool>();
-        if (j.contains("show_home_nodes"))
-            m_settings.showHomeNodes     = j["show_home_nodes"].get<bool>();
         if (j.contains("show_map_chests"))
             m_settings.showMapChests     = j["show_map_chests"].get<bool>();
+        if (j.contains("show_ley_line_anomaly"))
+            m_settings.showLeyLineAnomaly = j["show_ley_line_anomaly"].get<bool>();
         if (j.contains("window_visible"))
             m_settings.windowVisible     = j["window_visible"].get<bool>();
         if (j.contains("window_pos_x"))
@@ -91,10 +89,9 @@ bool Settings::Save() const
         json j;
         j["api_key_hex"]         = obfuscated;
         j["refresh_interval_sec"] = m_settings.refreshIntervalSec;
-        j["show_wizards_vault"]  = m_settings.showWizardsVault;
         j["show_world_bosses"]   = m_settings.showWorldBosses;
-        j["show_home_nodes"]     = m_settings.showHomeNodes;
         j["show_map_chests"]     = m_settings.showMapChests;
+        j["show_ley_line_anomaly"] = m_settings.showLeyLineAnomaly;
         j["window_visible"]      = m_settings.windowVisible;
         j["window_pos_x"]        = m_settings.windowPosX;
         j["window_pos_y"]        = m_settings.windowPosY;

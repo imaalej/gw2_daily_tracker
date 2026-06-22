@@ -1,4 +1,5 @@
 #include "nexus/Nexus.h"
+#include "mumble/Mumble.h"
 #include "imgui/imgui.h"
 #include "core/DataTypes.h"
 #include "core/Cache.h"
@@ -114,6 +115,43 @@ static void DrawCompletionIcon(CompletionState state)
 }
 
 // ---------------------------------------------------------------------------
+// Mumble link access (current map ID + active character name), needed for
+// Ley-Line Anomaly detection. DL_MUMBLE_LINK gives us Mumble::Data, whose
+// Context.MapID is the player's current map, and whose Identity (delivered
+// separately via DL_MUMBLE_LINK_IDENTITY, or embedded depending on Nexus
+// version) gives the active character's name. Nexus exposes the parsed
+// identity directly via DataLink_Get(DL_MUMBLE_LINK_IDENTITY).
+// ---------------------------------------------------------------------------
+static bool GetCurrentMapAndCharacter(int& outMapId, std::string& outCharacterName)
+{
+    outMapId = -1;
+    outCharacterName.clear();
+
+    if (!g_nexus || !g_nexus->DataLink_Get)
+        return false;
+
+    void* mumbleData = g_nexus->DataLink_Get(DL_MUMBLE_LINK);
+    if (mumbleData)
+    {
+        auto* data = static_cast<Mumble::Data*>(mumbleData);
+        outMapId = static_cast<int>(data->Context.MapID);
+    }
+
+    void* identityData = g_nexus->DataLink_Get(DL_MUMBLE_LINK_IDENTITY);
+    if (identityData)
+    {
+        auto* identity = static_cast<Mumble::Identity*>(identityData);
+        // Name is a fixed-size char buffer; guard against missing
+        // null-termination from the shared-memory link.
+        char nameBuf[sizeof(identity->Name) + 1] = {};
+        std::memcpy(nameBuf, identity->Name, sizeof(identity->Name));
+        outCharacterName = nameBuf;
+    }
+
+    return outMapId >= 0 && !outCharacterName.empty();
+}
+
+// ---------------------------------------------------------------------------
 // Forward declarations for render callbacks
 // ---------------------------------------------------------------------------
 static void AddonRender();
@@ -168,45 +206,6 @@ static void RenderStatusBar()
         g_dataStore->ForceRefresh();
 }
 
-static void RenderWizardsVault(const DailySnapshot& snap)
-{
-    if (!ImGui::CollapsingHeader("Wizard's Vault", ImGuiTreeNodeFlags_DefaultOpen))
-        return;
-
-    if (snap.wizardsVault.empty())
-    {
-        ImGui::TextDisabled("No data available.");
-        return;
-    }
-
-    for (const auto& obj : snap.wizardsVault)
-    {
-        CompletionState state = obj.GetState();
-        DrawCompletionIcon(state);
-        ImGui::SameLine();
-
-        float fraction = 0.0f;
-        if (obj.progressComplete > 0)
-            fraction = static_cast<float>(obj.progressCurrent) /
-                       static_cast<float>(obj.progressComplete);
-        if (fraction > 1.0f) fraction = 1.0f;
-        if (fraction < 0.0f) fraction = 0.0f;
-
-        ImGui::Text("%s", obj.title.c_str());
-
-        char overlay[64];
-        std::snprintf(overlay, sizeof(overlay), "%d / %d",
-                      obj.progressCurrent, obj.progressComplete);
-
-        ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f), overlay);
-
-        if (obj.claimed)
-            ImGui::TextDisabled("  (claimed)");
-
-        ImGui::Spacing();
-    }
-}
-
 static void RenderWorldBosses(const DailySnapshot& snap)
 {
     if (!ImGui::CollapsingHeader("World Bosses", ImGuiTreeNodeFlags_DefaultOpen))
@@ -246,25 +245,31 @@ static void RenderWorldBosses(const DailySnapshot& snap)
     }
 }
 
-static void RenderHomeNodes(const DailySnapshot& snap)
+static void RenderLeyLineAnomaly(const DailySnapshot& snap)
 {
-    if (!ImGui::CollapsingHeader("Home Instance Nodes", ImGuiTreeNodeFlags_DefaultOpen))
+    if (!ImGui::CollapsingHeader("Ley-Line Anomaly", ImGuiTreeNodeFlags_DefaultOpen))
         return;
 
-    if (snap.homeNodes.empty())
+    const auto& ll = snap.leyLineAnomaly;
+
+    if (ll.nextSpawnUtcSec < 0)
     {
         ImGui::TextDisabled("No data available.");
         return;
     }
 
-    ImGui::TextDisabled("Harvest status is not exposed by the GW2 API.");
+    DrawCompletionIcon(ll.completion);
+    ImGui::SameLine();
+    ImGui::Text("Next: %s", ll.nextMapName.c_str());
 
-    for (const auto& node : snap.homeNodes)
-    {
-        DrawCompletionIcon(node.completion);
-        ImGui::SameLine();
-        ImGui::TextUnformatted(node.name.c_str());
-    }
+    std::time_t nowUtc = std::time(nullptr);
+    int secondsToday = static_cast<int>(nowUtc % 86400);
+    int diff = ll.nextSpawnUtcSec - secondsToday;
+    if (diff < 0)
+        diff += 86400;
+
+    ImGui::Text("Spawns in: %s", FormatCountdown(diff).c_str());
+    ImGui::TextDisabled("Detected heuristically via map + item-count tracking.");
 }
 
 static void RenderMapChests(const DailySnapshot& snap)
@@ -291,6 +296,13 @@ static void AddonRender()
     // Drive refresh / daily-reset logic and data-updated callback on main thread.
     g_dataStore->Tick();
 
+    // Ley-Line Anomaly detection needs the player's current map + active
+    // character every frame, regardless of whether the window is visible.
+    int currentMapId = -1;
+    std::string currentCharacterName;
+    GetCurrentMapAndCharacter(currentMapId, currentCharacterName);
+    g_dataStore->TickLeyLineAnomaly(currentMapId, currentCharacterName);
+
     AddonSettings& settings = g_settings->Get();
     if (!settings.windowVisible)
         return;
@@ -303,10 +315,9 @@ static void AddonRender()
     {
         DailySnapshot snap = g_dataStore->GetSnapshot();
 
-        if (settings.showWizardsVault) RenderWizardsVault(snap);
-        if (settings.showWorldBosses)  RenderWorldBosses(snap);
-        if (settings.showHomeNodes)    RenderHomeNodes(snap);
-        if (settings.showMapChests)    RenderMapChests(snap);
+        if (settings.showLeyLineAnomaly) RenderLeyLineAnomaly(snap);
+        if (settings.showWorldBosses)    RenderWorldBosses(snap);
+        if (settings.showMapChests)      RenderMapChests(snap);
 
         RenderStatusBar();
 
@@ -339,7 +350,7 @@ static void AddonOptionsRender()
 
     // ---- API key ----
     ImGui::TextUnformatted("GW2 API Key");
-    ImGui::TextDisabled("Requires scopes: account, progression, unlocks");
+    ImGui::TextDisabled("Requires scopes: account, progression, unlocks, inventories");
 
     if (ImGui::InputText("##apikey", g_apiKeyBuffer, sizeof(g_apiKeyBuffer),
                           ImGuiInputTextFlags_Password))
@@ -411,9 +422,8 @@ static void AddonOptionsRender()
     ImGui::TextUnformatted("Visible Categories");
 
     bool changed = false;
-    changed |= ImGui::Checkbox("Wizard's Vault", &settings.showWizardsVault);
-    changed |= ImGui::Checkbox("World Bosses",   &settings.showWorldBosses);
-    changed |= ImGui::Checkbox("Home Instance Nodes", &settings.showHomeNodes);
+    changed |= ImGui::Checkbox("Ley-Line Anomaly",    &settings.showLeyLineAnomaly);
+    changed |= ImGui::Checkbox("World Bosses",         &settings.showWorldBosses);
     changed |= ImGui::Checkbox("Hero's Choice Chests", &settings.showMapChests);
 
     if (changed)

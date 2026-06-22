@@ -56,6 +56,15 @@ public:
     // The DataStore posts a notification flag; the UI polls it via Tick().
     void SetOnDataUpdated(std::function<void()> cb);
 
+    // -----------------------------------------------------------------------
+    // Ley-Line Anomaly tracking.
+    // Must be called every frame from the main thread (where Mumble link
+    // data is available) so the DataStore can observe which map the player
+    // is in during the ~1-minute pre-window before each occurrence.
+    // currentCharacterName is needed to query that character's inventory.
+    // -----------------------------------------------------------------------
+    void TickLeyLineAnomaly(int currentMapId, const std::string& currentCharacterName);
+
 private:
     // Fetches all data categories asynchronously.
     void BeginFetch();
@@ -64,9 +73,6 @@ private:
     // via chained callbacks so we don't fire all requests simultaneously.
     void FetchStep_WorldBossCompletion();
     void FetchStep_WorldBossMeta(std::set<std::string> completedIds);
-    void FetchStep_WizardsVault();
-    void FetchStep_HomeNodesMeta();
-    void FetchStep_HomeNodesCompletion(nlohmann::json metaJson);
     void FetchStep_MapChestsMeta();
     void FetchStep_MapChestsCompletion(nlohmann::json metaJson);
     void FinalizeFetch();
@@ -74,6 +80,20 @@ private:
     // Checks if the daily reset has occurred since the last fetch
     // and invalidates the cache if so.
     void CheckDailyReset();
+
+    // -----------------------------------------------------------------------
+    // Ley-Line Anomaly internals
+    // -----------------------------------------------------------------------
+    // Begins sampling item counts (bank + materials + character inventory)
+    // at the start of an event window so we have a "before" baseline.
+    void LeyLine_BeginWindowSample(const std::string& characterName);
+    // Re-samples item counts at the end of the window and compares against
+    // the baseline + whether the player was seen in the right map.
+    void LeyLine_EndWindowSample(const std::string& characterName);
+    int  LeyLine_SumTrackedItems(const nlohmann::json& bank,
+                                 const nlohmann::json& materials,
+                                 const nlohmann::json& charInventory) const;
+    void LeyLine_RefreshNextOccurrence();
 
     Cache&      m_cache;
     Settings&   m_settings;
@@ -97,21 +117,35 @@ private:
     // Partial results accumulated across async steps
     struct PendingData
     {
-        std::vector<WizardsVaultObjective> wizardsVault;
         std::vector<WorldBossEntry>        worldBosses;
-        std::vector<HomeNode>              homeNodes;
         std::vector<MapChest>              mapChests;
         std::mutex                         mtx;
     };
     PendingData m_pending;
 
     // Tracks how many async steps are still outstanding so we know when done.
+    static constexpr int kTotalFetchSteps = 2; // WorldBosses, MapChests
     std::atomic<int>  m_pendingSteps { 0 };
     std::atomic<bool> m_anyStepFailed{ false };
 
     void SetStatus(FetchStatus s, const std::string& msg = "");
     void OnFetchError(const std::string& msg, FetchStatus s);
-    void DecrementAndFinalize();
+    void DecrementAndFinalize(const char* stepName);
+
+    // -----------------------------------------------------------------------
+    // Ley-Line Anomaly state (main-thread only; no locking needed since
+    // TickLeyLineAnomaly/Tick are both only ever called from AddonRender).
+    // -----------------------------------------------------------------------
+    enum class LeyLineWindowPhase
+    {
+        Idle,           // outside any event window
+        Sampling,       // inside the ~20-min window, baseline captured
+    };
+    LeyLineWindowPhase m_leyLinePhase = LeyLineWindowPhase::Idle;
+    int                m_leyLineActiveOccurrenceSec = -1; // which occurrence we're tracking
+    int                m_leyLineBaselineCount       = -1; // -1 = not yet sampled
+    bool               m_leyLineSeenCorrectMap      = false;
+    std::atomic<bool>  m_leyLineSampleInFlight      { false };
 };
 
 } // namespace DailyTracker

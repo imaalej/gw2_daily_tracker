@@ -38,8 +38,11 @@ public:
                     std::chrono::seconds ttl);
 
     // Retrieve a cached value.  Returns true and populates `outValue` if the
-    // entry exists and has not expired.
-    bool Get(const std::string& key, nlohmann::json& outValue) const;
+    // entry exists and has not expired (unless ignoreTTL is true, in which
+    // case expiry is not checked — used as a stale-data fallback when a
+    // live API call fails and we'd rather show old data than none at all).
+    bool Get(const std::string& key, nlohmann::json& outValue,
+             bool ignoreTTL = false) const;
 
     // Explicitly invalidate a key.
     void Invalidate(const std::string& key);

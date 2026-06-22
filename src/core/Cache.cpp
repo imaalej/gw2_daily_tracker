@@ -53,7 +53,7 @@ void Cache::SetWithTTL(const std::string& key, const nlohmann::json& value,
     Set(key, value, std::chrono::system_clock::now() + ttl);
 }
 
-bool Cache::Get(const std::string& key, nlohmann::json& outValue) const
+bool Cache::Get(const std::string& key, nlohmann::json& outValue, bool ignoreTTL) const
 {
     auto it = m_data.find(key);
     if (it == m_data.end())
@@ -63,12 +63,15 @@ bool Cache::Get(const std::string& key, nlohmann::json& outValue) const
     if (!entry.contains("expires_unix") || !entry.contains("value"))
         return false;
 
-    auto expiresUnix = entry["expires_unix"].get<int64_t>();
-    auto nowUnix = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (!ignoreTTL)
+    {
+        auto expiresUnix = entry["expires_unix"].get<int64_t>();
+        auto nowUnix = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
 
-    if (nowUnix >= expiresUnix)
-        return false; // expired
+        if (nowUnix >= expiresUnix)
+            return false; // expired
+    }
 
     outValue = entry["value"];
     return true;

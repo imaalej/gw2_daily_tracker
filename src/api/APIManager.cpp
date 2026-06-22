@@ -90,19 +90,9 @@ void APIManager::SetApiKey(const std::string& key)
 // ---------------------------------------------------------------------------
 // Endpoint helpers
 // ---------------------------------------------------------------------------
-void APIManager::FetchWizardsVaultDaily(ApiCallback cb)
-{
-    Get("/v2/account/wizardsvault/daily", true, m_language, std::move(cb));
-}
-
 void APIManager::FetchWorldBossCompletion(ApiCallback cb)
 {
     Get("/v2/account/worldbosses", true, m_language, std::move(cb));
-}
-
-void APIManager::FetchHomeNodes(ApiCallback cb)
-{
-    Get("/v2/account/home/nodes", true, m_language, std::move(cb));
 }
 
 void APIManager::FetchMapChests(ApiCallback cb)
@@ -110,15 +100,41 @@ void APIManager::FetchMapChests(ApiCallback cb)
     Get("/v2/account/mapchests", true, m_language, std::move(cb));
 }
 
+void APIManager::FetchAccountBank(ApiCallback cb)
+{
+    Get("/v2/account/bank", true, m_language, std::move(cb));
+}
+
+void APIManager::FetchAccountMaterials(ApiCallback cb)
+{
+    Get("/v2/account/materials", true, m_language, std::move(cb));
+}
+
+void APIManager::FetchCharacterInventory(const std::string& characterName, ApiCallback cb)
+{
+    // Character names can contain spaces and other characters that need
+    // percent-encoding in the URL path.
+    CURL* escapeHandle = curl_easy_init();
+    std::string encodedName = characterName;
+    if (escapeHandle)
+    {
+        char* escaped = curl_easy_escape(escapeHandle, characterName.c_str(),
+                                          static_cast<int>(characterName.size()));
+        if (escaped)
+        {
+            encodedName = escaped;
+            curl_free(escaped);
+        }
+        curl_easy_cleanup(escapeHandle);
+    }
+
+    std::string ep = "/v2/characters/" + encodedName + "/inventory";
+    Get(ep, true, m_language, std::move(cb));
+}
+
 void APIManager::FetchWorldBossMeta(const std::string& lang, ApiCallback cb)
 {
     std::string ep = "/v2/worldbosses?ids=all&lang=" + lang;
-    Get(ep, false, lang, std::move(cb));
-}
-
-void APIManager::FetchHomeNodeMeta(const std::string& lang, ApiCallback cb)
-{
-    std::string ep = "/v2/home/nodes?ids=all&lang=" + lang;
     Get(ep, false, lang, std::move(cb));
 }
 
@@ -173,8 +189,30 @@ void APIManager::WorkerLoop()
         MaybeThrottle(m_rlRemaining, m_rlLimit);
 
         ApiResult result = PerformGet(req.url, req.apiKey);
+
+        // The callback (owned by DataStore) does JSON parsing via
+        // ResponseParser. A malformed cache file or unexpected API shape
+        // could throw there; without this guard, an uncaught exception
+        // would terminate the worker thread and leave m_fetchInFlight
+        // stuck `true` forever (see DataStore::Tick() heartbeat for the
+        // complementary main-thread-side safety net).
         if (req.callback)
-            req.callback(std::move(result));
+        {
+            try
+            {
+                req.callback(std::move(result));
+            }
+            catch (const std::exception& e)
+            {
+                LogMessage(5, "DailyTracker",
+                    std::string("CRITICAL: Unhandled exception in API callback: ") + e.what());
+            }
+            catch (...)
+            {
+                LogMessage(5, "DailyTracker",
+                    "CRITICAL: Unknown unhandled exception in API callback.");
+            }
+        }
     }
 }
 

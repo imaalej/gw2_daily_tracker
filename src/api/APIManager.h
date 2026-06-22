@@ -48,16 +48,16 @@ public:
     // -----------------------------------------------------------------------
     // Authenticated endpoints
     // -----------------------------------------------------------------------
-    void FetchWizardsVaultDaily(ApiCallback cb);
     void FetchWorldBossCompletion(ApiCallback cb);
-    void FetchHomeNodes(ApiCallback cb);
     void FetchMapChests(ApiCallback cb);
+    void FetchAccountBank(ApiCallback cb);
+    void FetchAccountMaterials(ApiCallback cb);
+    void FetchCharacterInventory(const std::string& characterName, ApiCallback cb);
 
     // -----------------------------------------------------------------------
     // Unauthenticated / metadata endpoints
     // -----------------------------------------------------------------------
     void FetchWorldBossMeta(const std::string& lang, ApiCallback cb);
-    void FetchHomeNodeMeta(const std::string& lang, ApiCallback cb);
     void FetchMapChestMeta(const std::string& lang, ApiCallback cb);
 
     // Generic GET (public)
