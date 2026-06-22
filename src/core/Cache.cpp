@@ -1,6 +1,7 @@
 #include "Cache.h"
 #include <fstream>
 #include <iomanip>
+#include <mutex>
 
 namespace DailyTracker
 {
@@ -11,6 +12,7 @@ Cache::Cache(const std::filesystem::path& addonDir)
 
 void Cache::Load()
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     if (!std::filesystem::exists(m_cachePath))
         return;
 
@@ -24,6 +26,7 @@ void Cache::Load()
 
 void Cache::Save() const
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     std::filesystem::create_directories(m_cachePath.parent_path());
     std::ofstream file(m_cachePath);
     if (file.is_open())
@@ -33,6 +36,7 @@ void Cache::Save() const
 void Cache::Set(const std::string& key, const nlohmann::json& value,
                 std::chrono::system_clock::time_point expiresAt)
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     auto expiresUnix = std::chrono::duration_cast<std::chrono::seconds>(
         expiresAt.time_since_epoch()).count();
 
@@ -55,6 +59,7 @@ void Cache::SetWithTTL(const std::string& key, const nlohmann::json& value,
 
 bool Cache::Get(const std::string& key, nlohmann::json& outValue, bool ignoreTTL) const
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     auto it = m_data.find(key);
     if (it == m_data.end())
         return false;
@@ -79,11 +84,13 @@ bool Cache::Get(const std::string& key, nlohmann::json& outValue, bool ignoreTTL
 
 void Cache::Invalidate(const std::string& key)
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     m_data.erase(key);
 }
 
 void Cache::InvalidateAll()
 {
+    std::lock_guard<std::mutex> lock(m_mtx);
     m_data = nlohmann::json::object();
 }
 

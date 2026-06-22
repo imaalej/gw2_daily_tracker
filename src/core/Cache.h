@@ -2,6 +2,7 @@
 #include <string>
 #include <chrono>
 #include <filesystem>
+#include <mutex>
 #include "json.hpp"
 
 namespace DailyTracker
@@ -58,6 +59,7 @@ public:
 private:
     std::filesystem::path   m_cachePath;
     nlohmann::json          m_data;  // { key: { "value": ..., "expires_unix": ... } }
+    mutable std::mutex      m_mtx;   // protects m_data and file I/O
 };
 
 } // namespace DailyTracker

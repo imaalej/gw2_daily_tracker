@@ -89,7 +89,7 @@ void DataStore::Tick()
     // discarded callback, or a step that decremented incorrectly). Force a
     // hard reset rather than leaving the UI stuck on "Refreshing..." and
     // the Refresh Now button permanently inert.
-    if (m_fetchInFlight)
+    if (m_fetchInFlight.load())
     {
         auto stalledFor = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFetchTime);
         if (stalledFor > k_fetchStallTimeout)
@@ -105,7 +105,7 @@ void DataStore::Tick()
     auto interval = std::chrono::seconds(m_settings.Get().refreshIntervalSec);
     bool overdue  = (now - m_lastFetchTime) >= interval;
 
-    if (overdue && !m_fetchInFlight && m_settings.HasApiKey())
+    if (overdue && !m_fetchInFlight.load() && m_settings.HasApiKey())
         BeginFetch();
 
     // Fire data-updated callback if flagged
@@ -115,7 +115,7 @@ void DataStore::Tick()
 
 void DataStore::ForceRefresh()
 {
-    if (!m_fetchInFlight)
+    if (!m_fetchInFlight.load())
         BeginFetch();
 }
 
@@ -139,7 +139,7 @@ DailySnapshot DataStore::GetSnapshot() const
     return m_snapshot;
 }
 
-FetchStatus DataStore::GetStatus() const { return m_status; }
+FetchStatus DataStore::GetStatus() const { return m_status.load(); }
 
 std::string DataStore::GetStatusMessage() const
 {
@@ -152,14 +152,14 @@ std::string DataStore::GetStatusMessage() const
 // ---------------------------------------------------------------------------
 void DataStore::SetStatus(FetchStatus s, const std::string& msg)
 {
-    m_status = s;
+    m_status.store(s);
     std::lock_guard<std::mutex> lk(m_statusMsgMtx);
     m_statusMessage = msg;
 }
 
 void DataStore::OnFetchError(const std::string& msg, FetchStatus s)
 {
-    m_anyStepFailed = true;
+    m_anyStepFailed.store(true);
     SetStatus(s, msg);
     DecrementAndFinalize("error-path");
 }
@@ -198,7 +198,7 @@ void DataStore::CheckDailyReset()
         m_nextDailyReset = Cache::NextDailyReset(now);
 
         // Force immediate refresh after reset
-        if (!m_fetchInFlight && m_settings.HasApiKey())
+        if (!m_fetchInFlight.load() && m_settings.HasApiKey())
             BeginFetch();
     }
 }
@@ -211,7 +211,7 @@ void DataStore::BeginFetch()
     if (m_fetchInFlight.exchange(true))
         return;
 
-    m_anyStepFailed = false;
+    m_anyStepFailed.store(false);
     m_pendingSteps  = kTotalFetchSteps;
     m_lastFetchTime = std::chrono::system_clock::now();
     SetStatus(FetchStatus::Fetching, "Refreshing data...");
@@ -499,6 +499,10 @@ void DataStore::FetchStep_MapChestsCompletion(nlohmann::json metaJson)
 // ---------------------------------------------------------------------------
 void DataStore::FinalizeFetch()
 {
+    // CRITICAL: reset the in-flight flag before any operation that could throw.
+    m_fetchInFlight = false;
+    m_dataUpdated   = true;
+
     DailySnapshot snap;
     {
         std::lock_guard<std::mutex> lk(m_pending.mtx);
@@ -506,7 +510,6 @@ void DataStore::FinalizeFetch()
         snap.mapChests    = std::move(m_pending.mapChests);
     }
     snap.lastRefreshed = std::chrono::system_clock::now();
-
     {
         std::lock_guard<std::mutex> lk(m_snapshotMtx);
         // Ley-Line Anomaly state is computed independently on the main
@@ -516,14 +519,19 @@ void DataStore::FinalizeFetch()
         m_snapshot = std::move(snap);
     }
 
-    if (!m_anyStepFailed)
+    if (!m_anyStepFailed.load())
         SetStatus(FetchStatus::Ok, "");
 
     LogMessage(2, "DailyTracker", "FinalizeFetch: fetch cycle complete");
 
-    m_cache.Save();
-    m_fetchInFlight = false;
-    m_dataUpdated   = true;  // signals Tick() to fire callback
+    // Save cache – catch any exception so it doesn't skip the flag reset (already done).
+    try {
+        m_cache.Save();
+    } catch (const std::exception& e) {
+        LogMessage(3, "DailyTracker", std::string("Failed to save cache: ") + e.what());
+    } catch (...) {
+        LogMessage(3, "DailyTracker", "Failed to save cache: unknown error");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -608,7 +616,7 @@ void DataStore::LeyLine_BeginWindowSample(const std::string& characterName)
         try
         {
             int total = LeyLine_SumTrackedItems((*results)[0], (*results)[1], (*results)[2]);
-            m_leyLineBaselineCount = total;
+            m_leyLineBaselineCount.store(total);
             LogMessage(2, "DailyTracker",
                 "Ley-Line Anomaly: captured baseline item count = " + std::to_string(total));
         }
@@ -616,7 +624,7 @@ void DataStore::LeyLine_BeginWindowSample(const std::string& characterName)
         {
             LogMessage(3, "DailyTracker",
                 std::string("Ley-Line Anomaly: baseline sample failed: ") + e.what());
-            m_leyLineBaselineCount = -1;
+            m_leyLineBaselineCount.store(-1);
         }
         m_leyLineSampleInFlight = false;
     };
@@ -640,13 +648,13 @@ void DataStore::LeyLine_BeginWindowSample(const std::string& characterName)
 
 void DataStore::LeyLine_EndWindowSample(const std::string& characterName)
 {
-    if (m_leyLineSampleInFlight.exchange(true))
-        return;
-
+    // Always run the end sample – even if baseline is still in flight,
+    // we'll treat baseline == -1 as Unknown state.
+    // (The guard that was here has been removed.)
     auto results = std::make_shared<std::array<nlohmann::json, 3>>();
     auto remaining = std::make_shared<std::atomic<int>>(3);
     bool sawCorrectMap = m_leyLineSeenCorrectMap;
-    int  baseline       = m_leyLineBaselineCount;
+    int  baseline       = m_leyLineBaselineCount.load();
 
     auto onOneDone = [this, results, remaining, sawCorrectMap, baseline]()
     {
@@ -739,7 +747,7 @@ void DataStore::TickLeyLineAnomaly(int currentMapId, const std::string& currentC
             // "before" baseline immediately.
             m_leyLinePhase                = LeyLineWindowPhase::Sampling;
             m_leyLineActiveOccurrenceSec  = activeSpot->spawnUtcSec;
-            m_leyLineBaselineCount        = -1;
+            m_leyLineBaselineCount.store(-1);
             m_leyLineSeenCorrectMap       = (currentMapId == activeSpot->mapId);
 
             {

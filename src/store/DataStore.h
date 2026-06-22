@@ -143,7 +143,7 @@ private:
     };
     LeyLineWindowPhase m_leyLinePhase = LeyLineWindowPhase::Idle;
     int                m_leyLineActiveOccurrenceSec = -1; // which occurrence we're tracking
-    int                m_leyLineBaselineCount       = -1; // -1 = not yet sampled
+    std::atomic<int>   m_leyLineBaselineCount       { -1 }; // -1 = not yet sampled
     bool               m_leyLineSeenCorrectMap      = false;
     std::atomic<bool>  m_leyLineSampleInFlight      { false };
 };
