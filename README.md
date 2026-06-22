@@ -9,6 +9,7 @@ An addon to track dailies that aren't tracked by the achievements menu such as w
 - Configurable refresh interval and keybind support
 
 To do:
-- Ley line anomoly tracking
-- fix "unknown" timers
-
+- ~~Ley line anomoly tracking~~
+- ~~fix "unknown" timers~~
+- Add a quickaccess icon
+- Improve user experience
