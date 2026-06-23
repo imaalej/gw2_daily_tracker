@@ -181,6 +181,7 @@ static void RenderStatusBar()
         case FetchStatus::NetworkError:
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
                 "Network error: %s", msg.c_str());
+            ImGui::TextWrapped("Data shown may be from cache. Will retry automatically.");
             break;
 
         case FetchStatus::NoApiKey:
@@ -191,7 +192,7 @@ static void RenderStatusBar()
             break;
 
         case FetchStatus::Fetching:
-            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Refreshing...");
+            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Refreshing data...");
             break;
 
         case FetchStatus::Ok:
@@ -204,8 +205,26 @@ static void RenderStatusBar()
     DailySnapshot snap = g_dataStore->GetSnapshot();
     ImGui::Text("Last refreshed: %s", FormatTimeOfDay(snap.lastRefreshed).c_str());
 
-    if (ImGui::Button("Refresh Now"))
+    // While a fetch is in-flight, show the button grayed-out and non-interactive.
+    // BeginDisabled/EndDisabled are imgui 1.87+; push colors manually for compat.
+    bool fetching = (status == FetchStatus::Fetching);
+    if (fetching)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.35f, 0.35f, 0.35f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.35f, 0.35f, 0.35f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.35f, 0.35f, 0.35f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
+    }
+
+    if (ImGui::Button("Refresh Now") && !fetching)
         g_dataStore->ForceRefresh();
+
+    if (fetching)
+    {
+        ImGui::PopStyleColor(4);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "(fetching...)");
+    }
 }
 
 static void RenderWorldBosses(const DailySnapshot& snap)
@@ -215,7 +234,15 @@ static void RenderWorldBosses(const DailySnapshot& snap)
 
     if (snap.worldBosses.empty())
     {
-        ImGui::TextDisabled("No data available.");
+        FetchStatus status = g_dataStore->GetStatus();
+        if (status == FetchStatus::Fetching)
+            ImGui::TextDisabled("Loading...");
+        else if (status == FetchStatus::NoApiKey || status == FetchStatus::ApiKeyMissing)
+            ImGui::TextDisabled("Set an API key to track completion.");
+        else if (status == FetchStatus::AuthError)
+            ImGui::TextDisabled("Authentication error – check your API key.");
+        else
+            ImGui::TextDisabled("No data available.");
         return;
     }
 
@@ -256,7 +283,9 @@ static void RenderLeyLineAnomaly(const DailySnapshot& snap)
 
     if (ll.nextSpawnUtcSec < 0)
     {
-        ImGui::TextDisabled("No data available.");
+        // The Ley-Line schedule is hardcoded and doesn't need an API call,
+        // so if nextSpawnUtcSec is still -1 the background task hasn't run yet.
+        ImGui::TextDisabled("Calculating next occurrence...");
         return;
     }
 
@@ -281,7 +310,15 @@ static void RenderMapChests(const DailySnapshot& snap)
 
     if (snap.mapChests.empty())
     {
-        ImGui::TextDisabled("No data available.");
+        FetchStatus status = g_dataStore->GetStatus();
+        if (status == FetchStatus::Fetching)
+            ImGui::TextDisabled("Loading...");
+        else if (status == FetchStatus::NoApiKey || status == FetchStatus::ApiKeyMissing)
+            ImGui::TextDisabled("Set an API key to track completion.");
+        else if (status == FetchStatus::AuthError)
+            ImGui::TextDisabled("Authentication error – check your API key.");
+        else
+            ImGui::TextDisabled("No data available.");
         return;
     }
 

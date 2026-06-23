@@ -29,6 +29,9 @@ DataStore::DataStore(Cache& cache, Settings& settings, APIManager& api)
     : m_cache(cache), m_settings(settings), m_api(api)
 {
     m_nextDailyReset = Cache::NextDailyReset();
+    // Initialize to "now" so Tick()'s auto-refresh doesn't immediately fire a
+    // duplicate fetch on the first frame — Initialize() already queues one.
+    m_lastFetchTime = std::chrono::system_clock::now();
 }
 
 DataStore::~DataStore()
@@ -87,6 +90,28 @@ void DataStore::Tick()
     // Check for data update flag and fire callback
     if (m_dataUpdated.exchange(false) && m_onDataUpdated)
         m_onDataUpdated();
+
+    // Periodic auto-refresh: check once per second whether a new fetch is due.
+    // This respects the user-configured refresh interval and is the only place
+    // the "re-fetch on schedule" logic lives (background thread has no timer).
+    if (!m_fetchInFlight.load() && m_settings.HasApiKey())
+    {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsedSinceCheck = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - m_lastAutoRefreshCheck).count();
+
+        if (elapsedSinceCheck >= 1000)
+        {
+            m_lastAutoRefreshCheck = now;
+
+            auto sinceLastFetch = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now() - m_lastFetchTime).count();
+            int intervalSec = m_settings.Get().refreshIntervalSec;
+
+            if (sinceLastFetch >= intervalSec)
+                PostTask([this]() { BeginFetch(); });
+        }
+    }
 }
 
 void DataStore::ForceRefresh()
@@ -120,7 +145,13 @@ void DataStore::OnApiKeyChanged()
 {
     m_api.SetApiKey(m_settings.ApiKey());
     if (m_settings.HasApiKey())
+    {
+        // Set status eagerly on the calling thread so the UI immediately stops
+        // showing "No API key" and shows "Refreshing..." before the background
+        // task actually picks up and calls BeginFetch().
+        SetStatus(FetchStatus::Fetching, "Refreshing data...");
         PostTask([this]() { BeginFetch(); });
+    }
     else
         SetStatus(FetchStatus::NoApiKey, "Enter your GW2 API key in Settings");
 }
@@ -335,8 +366,10 @@ void DataStore::FetchStep_WorldBossMeta(std::set<std::string> completedIds)
         try
         {
             auto bosses = ResponseParser::ParseWorldBossMeta(cachedMeta, completedIds);
-            std::lock_guard<std::mutex> lk(m_pending.mtx);
-            m_pending.worldBosses = std::move(bosses);
+            {
+                std::lock_guard<std::mutex> lk(m_pending.mtx);
+                m_pending.worldBosses = std::move(bosses);
+            }
             DecrementAndFinalize("WorldBossMeta(cache)");
         }
         catch (const std::exception& e)
@@ -359,8 +392,10 @@ void DataStore::FetchStep_WorldBossMeta(std::set<std::string> completedIds)
                 try
                 {
                     auto bosses = ResponseParser::ParseWorldBossMeta(staleMeta, completedIds);
-                    std::lock_guard<std::mutex> lk(m_pending.mtx);
-                    m_pending.worldBosses = std::move(bosses);
+                    {
+                        std::lock_guard<std::mutex> lk(m_pending.mtx);
+                        m_pending.worldBosses = std::move(bosses);
+                    }
                     DecrementAndFinalize("WorldBossMeta(stale-fallback)");
                     return;
                 }
@@ -386,8 +421,10 @@ void DataStore::FetchStep_WorldBossMeta(std::set<std::string> completedIds)
         {
             m_cache.SetWithTTL(k_cacheBossesMeta, res.body, std::chrono::hours(24));
             auto bosses = ResponseParser::ParseWorldBossMeta(res.body, completedIds);
-            std::lock_guard<std::mutex> lk(m_pending.mtx);
-            m_pending.worldBosses = std::move(bosses);
+            {
+                std::lock_guard<std::mutex> lk(m_pending.mtx);
+                m_pending.worldBosses = std::move(bosses);
+            }
             DecrementAndFinalize("WorldBossMeta(network)");
         }
         catch (const std::exception& e)
@@ -450,8 +487,10 @@ void DataStore::FetchStep_MapChestsCompletion(nlohmann::json metaJson)
         try
         {
             auto chests = ResponseParser::ParseMapChests(metaJson, cachedCompletion);
-            std::lock_guard<std::mutex> lk(m_pending.mtx);
-            m_pending.mapChests = std::move(chests);
+            {
+                std::lock_guard<std::mutex> lk(m_pending.mtx);
+                m_pending.mapChests = std::move(chests);
+            }
             DecrementAndFinalize("MapChestsCompletion(cache)");
         }
         catch (const std::exception& e)
@@ -473,8 +512,10 @@ void DataStore::FetchStep_MapChestsCompletion(nlohmann::json metaJson)
                 try
                 {
                     auto chests = ResponseParser::ParseMapChests(metaJson, staleCompletion);
-                    std::lock_guard<std::mutex> lk(m_pending.mtx);
-                    m_pending.mapChests = std::move(chests);
+                    {
+                        std::lock_guard<std::mutex> lk(m_pending.mtx);
+                        m_pending.mapChests = std::move(chests);
+                    }
                     DecrementAndFinalize("MapChestsCompletion(stale-fallback)");
                     return;
                 }
@@ -497,8 +538,10 @@ void DataStore::FetchStep_MapChestsCompletion(nlohmann::json metaJson)
         {
             m_cache.SetUntilDailyReset(k_cacheMapChests, res.body);
             auto chests = ResponseParser::ParseMapChests(metaJson, res.body);
-            std::lock_guard<std::mutex> lk(m_pending.mtx);
-            m_pending.mapChests = std::move(chests);
+            {
+                std::lock_guard<std::mutex> lk(m_pending.mtx);
+                m_pending.mapChests = std::move(chests);
+            }
             DecrementAndFinalize("MapChestsCompletion(network)");
         }
         catch (const std::exception& e)
@@ -510,35 +553,60 @@ void DataStore::FetchStep_MapChestsCompletion(nlohmann::json metaJson)
 }
 
 // ---------------------------------------------------------------------------
-// Finalize Fetch – called when all steps complete
+// Finalize Fetch – called when all steps complete (m_pending.mtx NOT held)
 // ---------------------------------------------------------------------------
 void DataStore::FinalizeFetch()
 {
-    DailySnapshot snap;
+    bool anyFailed = m_anyStepFailed.load();
+
+    if (!anyFailed)
     {
-        std::lock_guard<std::mutex> lk(m_pending.mtx);
-        snap.worldBosses = std::move(m_pending.worldBosses);
-        snap.mapChests   = std::move(m_pending.mapChests);
+        // All steps succeeded: move pending data into the live snapshot.
+        DailySnapshot snap;
+        {
+            std::lock_guard<std::mutex> lk(m_pending.mtx);
+            snap.worldBosses = std::move(m_pending.worldBosses);
+            snap.mapChests   = std::move(m_pending.mapChests);
+        }
+        snap.lastRefreshed = std::chrono::system_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(m_snapshotMtx);
+            snap.leyLineAnomaly = m_snapshot.leyLineAnomaly;
+            m_snapshot = std::move(snap);
+        }
+        SetStatus(FetchStatus::Ok, "");
+        LogMessage(2, "DailyTracker", "FinalizeFetch: fetch cycle complete, snapshot updated");
     }
-    snap.lastRefreshed = std::chrono::system_clock::now();
+    else
     {
-        std::lock_guard<std::mutex> lk(m_snapshotMtx);
-        snap.leyLineAnomaly = m_snapshot.leyLineAnomaly;
-        m_snapshot = std::move(snap);
+        // At least one step failed. Preserve the existing snapshot so sections
+        // never collapse to "No data available" due to a transient network error.
+        // The status/error message was already set by OnFetchError.
+        // Merge any partial successes in so the user sees as much as possible.
+        std::vector<WorldBossEntry> pendingBosses;
+        std::vector<MapChest>       pendingChests;
+        {
+            std::lock_guard<std::mutex> lk(m_pending.mtx);
+            pendingBosses = std::move(m_pending.worldBosses);
+            pendingChests = std::move(m_pending.mapChests);
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_snapshotMtx);
+            if (!pendingBosses.empty())
+                m_snapshot.worldBosses = std::move(pendingBosses);
+            if (!pendingChests.empty())
+                m_snapshot.mapChests = std::move(pendingChests);
+            if (!m_snapshot.worldBosses.empty() || !m_snapshot.mapChests.empty())
+                m_snapshot.lastRefreshed = std::chrono::system_clock::now();
+        }
+        LogMessage(3, "DailyTracker",
+            "FinalizeFetch: one or more steps failed – preserving existing snapshot data");
     }
 
-    // Clear in-flight flag AFTER snapshot is committed so GetSnapshot()
-    // always returns fresh data by the time the UI sees the flag change.
+    // Clear in-flight flag AFTER snapshot is committed.
     m_fetchInFlight = false;
-    // Signal main thread to repaint regardless of whether a callback was set.
     m_dataUpdated   = true;
 
-    if (!m_anyStepFailed.load())
-        SetStatus(FetchStatus::Ok, "");
-
-    LogMessage(2, "DailyTracker", "FinalizeFetch: fetch cycle complete");
-
-    // Keep Ley-Line next-occurrence fresh after every refresh cycle.
     LeyLine_RefreshNextOccurrence();
 
     try {

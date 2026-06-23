@@ -122,6 +122,10 @@ private:
     // Throttle for TickLeyLineAnomaly: accessed on the main (render) thread only.
     // Prevents flooding the task queue at 60fps when the player is in-game.
     std::chrono::steady_clock::time_point m_lastLeyLineTick{};
+
+    // Auto-refresh throttle: tracks when we last checked whether a periodic
+    // refresh is due. Accessed on the main (render) thread only.
+    std::chrono::steady_clock::time_point m_lastAutoRefreshCheck{};
 };
 
 } // namespace DailyTracker
